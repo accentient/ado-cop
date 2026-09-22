@@ -1,0 +1,34 @@
+# ado-cop is a public repo. Anything that names a client, its organization, its
+# work items or its credentials stays local. The only rules, pipelines and reports
+# that belong here are the anonymized examples at the repo root.
+
+# Client engagements. Each client gets a folder under clients/<name>/ holding its
+# rules file, annotated rule catalogue, pipeline and run reports. None of it is
+# committed; the folder as a whole is ignored.
+clients/
+
+# Run outputs. The report, its log and its JSON name real work items by ID and title.
+# This covers the default names next to the script and any dated report anywhere.
+ado-cop.md
+ado-cop.log
+ado-cop.json
+report*.md
+report*.log
+report*.json
+*.local.json
+
+# Tokens and local secrets. The script reads the PAT from a parameter or Credential
+# Manager, never from a file, but keep any local copy out just in case.
+*.pat
+*.token
+.env
+.env.*
+secrets.*
+*.secret.*
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
