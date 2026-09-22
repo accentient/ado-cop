@@ -23,19 +23,19 @@
   ```
   # ado-cop report
 
-  contoso, 2026-09-16 17:32. 31 rules, 1 project.
+  contoso, 2026-09-01 09:05. 31 rules, 1 project.
 
   | Rule   | Description                                   | Status | Notes                                        |
   |:-------|:----------------------------------------------|:------:|:---------------------------------------------|
   | **CFG (Configuration)** |                              |        |                                              |
   | CFG000 | Hub project uses hub process                  | 🟡     | On Agile, not Contoso Scrum                  |
-  | CFG110 | Hub project contains no repos                 | 🟡     | 2 repositories in the hub                    |
-  | CFG160 | Iterations have dates                         | 🟢     | Every sprint has dates (7 checked)           |
+  | CFG110 | Hub project contains no repos                 | 🟡     | 3 repositories in the hub                    |
+  | CFG160 | Iterations have dates                         | 🟢     | Every sprint has dates (12 checked)          |
   | **WRK (Work Items)** |                                 |        |                                              |
-  | WRK110 | Features have parent Epic                     | 🟡     | 175 open Features lack a parent Epic         |
-  | WRK300 | Closed Epics have no open children            | 🟡     | 8 open Features sit under closed Epics       |
+  | WRK110 | Features have parent Epic                     | 🟡     | 40 open Features lack a parent Epic          |
+  | WRK300 | Closed Epics have no open children            | 🟡     | 3 open Features sit under closed Epics       |
   | WRK700 | Items are not closed in batches               | 🟢     | No batch closing in the last 90 days         |
-  | WRK900 | No stale open items                           | 🟡     | 50 open items untouched for over 90 days     |
+  | WRK900 | No stale open items                           | 🟡     | 12 open items untouched for over 90 days     |
   ```
 
   Next to the report, `ado-cop.log` lists every offending item by ID, type, title, state and
@@ -210,6 +210,3 @@
   ## License
 
   MIT. See `LICENSE`.
-
-  Two notes on the draft. The "Rule families" table names families that do not exist yet as "planned"; drop those rows if you would rather the README only describe what ships. And the sample report is a scrubbed version of a real run, with the organization and process renamed;
-  the numbers are real, so change them if you do not want a client's counts in a public repo even anonymized.

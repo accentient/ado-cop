@@ -1,6 +1,6 @@
 # ado-cop rules
 
-Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implemented, reviewed and switched on in `rules.json`; 🧪 is implemented and switched on but not yet reviewed; ⭕ is a candidate for the backlog, drawn from the Inspire rule set, the assessment findings, and the decisions log. "Open" means every state except Closed and Removed. Numbers step by hundreds when the idea changes and by tens within an idea.
+Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implemented, reviewed and switched on in `rules.json`; 🧪 is implemented and switched on but not yet reviewed; ⭕ is a candidate for the backlog, drawn from assessments and engagements. "Open" means every state except Closed and Removed. Numbers step by hundreds when the idea changes and by tens within an idea.
 
 | Section | Status | Number | Rule | Description |
 |:--|:--:|:--|:--|:--|
@@ -10,8 +10,8 @@ Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implem
 |  | ⭕ | CFG035 | Users are added by group rule, not directly | Access is managed through Entra group rules rather than manual user additions. |
 |  | ⭕ | CFG040 | Spoke projects do not have Boards enabled | Spokes hold repos, pipelines, and artifacts; all work items live in the hub. |
 |  | ⭕ | CFG045 | Spoke projects keep their non-Boards services | Repos, Pipelines, Artifacts, and Test Plans stay on where a spoke uses them. |
-|  | ⭕ | CFG050 | No unexpected projects | Every project in the organization is the hub or a listed spoke; a fifth project appeared between the assessment and the first ado-cop run. |
-| Hub project | ⭕ | CFG100 | Hub project only has Boards enabled | Implemented but switched off: the Feature Management API that reports service states refuses every custom-scoped PAT (401 with Extensions Read, 16 Sep 2026) and answers only to full access. Check Project settings, Overview, in the browser. |
+|  | ⭕ | CFG050 | No unexpected projects | Every project in the organization is the hub or a listed spoke (setting); anything else is flagged. |
+| Hub project | ⭕ | CFG100 | Hub project only has Boards enabled | Implemented but switched off: the Feature Management API that reports service states refuses every custom-scoped PAT (401 even with Extensions Read) and answers only to full access. Check Project settings, Overview, in the browser. |
 |  | 🧪 | CFG110 | Hub project contains no repos | No Git repos or TFVC in the hub. |
 |  | 🧪 | CFG120 | Hub project contains no pipelines | No build or release definitions in the hub. |
 |  | 🧪 | CFG130 | Hub project contains no artifact feeds | No project-scoped feeds in the hub. |
@@ -25,7 +25,7 @@ Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implem
 |  | ⭕ | CFG190 | Iterations exist for the current and next PI | The calendar is always one PI ahead. |
 |  | ⭕ | CFG200 | Backlog levels match the hierarchy | Epic, Feature, and Story are the only portfolio and requirement backlogs enabled. |
 |  | ⭕ | CFG210 | Bugs managed with requirements | Every team shows Bugs on the backlog alongside Stories. |
-|  | ⭕ | CFG220 | Only agreed work item types are in use | Initiative, Idea Submission, and Strategic Theme are retired or declared in scope. |
+|  | ⭕ | CFG220 | Only agreed work item types are in use | Every work item type in use is on the agreed list (setting); types being retired are declared, not left lying around. |
 |  | ⭕ | CFG230 | Retired work item types have no open items | Nothing open remains on a type that is disabled or being retired. |
 |  | ⭕ | CFG240 | Rollup fields exist identically in every process | Business Value and the other value fields are the same field on Epic and Feature everywhere. |
 |  | ⭕ | CFG250 | Tags promoted to fields are no longer used as tags | Once a tag becomes a field, no open item still carries the tag. |
@@ -48,7 +48,7 @@ Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implem
 |  | ⭕ | CFG430 | Contributors only contains team admin and contributor groups | No individuals or other groups in Contributors. |
 |  | ⭕ | CFG440 | Build Administrators has no members | Empty in the hub; reviewed in spokes. |
 |  | ⭕ | CFG450 | Endpoint Administrators only contains Project Administrators | Service connections are managed by project admins only. |
-|  | ⭕ | CFG460 | Project Administrators is small | No more than N members (setting); the assessment found 15 in one project. |
+|  | ⭕ | CFG460 | Project Administrators is small | No more than N members (setting). |
 |  | ⭕ | CFG470 | Readers only contains team reader groups | No individuals in Readers. |
 |  | ⭕ | CFG480 | Release Administrators has no members | Empty in the hub; reviewed in spokes. |
 |  | ⭕ | CFG490 | No individual users in project groups | Only team permission groups are members of project-level groups. |
@@ -91,7 +91,7 @@ Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implem
 |  | ⭕ | WRK830 | Type of Work is set | Type of Work is set on every open Epic, Feature and Story. |
 |  | ⭕ | WRK840 | Bugs carry the Escaped flag | Escaped is set on every Bug once the field exists. |
 |  | ⭕ | WRK850 | Intake items get a Disposition | A Feature older than N days with no Disposition is a Business Response Time clock still running. |
-|  | ⭕ | WRK860 | Tags in use are on the approved list | Only approved tags remain after the cleanup. |
+|  | ⭕ | WRK860 | Tags in use are on the approved list | Only tags on the approved list (setting) are in use. |
 |  | ⭕ | WRK870 | High WIP | A team has more items in a column than its limit. |
 | Staleness | ✅ | WRK900 | No stale open items | Nothing open has gone untouched for more than StaleDays. |
 |  | ⭕ | WRK910 | No unrefined New items older than a PI | Items still New after a full PI were never refined. |
