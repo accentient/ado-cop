@@ -1,26 +1,25 @@
 # ado-cop rules
 
-Rules `ado-cop.ps1` checks against Azure DevOps, one row per rule. ✅ is implemented, reviewed and switched on in `rules.json`; 🧪 is implemented and switched on but not yet reviewed; ⭕ is a candidate for the backlog, drawn from assessments and engagements. "Open" means every state except Closed and Removed. Numbers step by hundreds when the idea changes and by tens within an idea.
+The master list of rules `ado-cop.ps1` can check against Azure DevOps, one row per rule. ✅ is implemented; ⭕ is not yet implemented, a candidate drawn from assessments and engagements. Which rules run on a given engagement is decided in that engagement's rules file, not here. "Open" means every state except Closed and Removed. Numbers step by hundreds when the idea changes and by tens within an idea.
 
 | Section | Status | Number | Rule | Description |
 |:--|:--:|:--|:--|:--|
-| Organization | 🧪 | CFG000 | Hub project uses the hub process | The hub project (HubProject setting) is on the hub process (HubProcess setting). |
+| Organization | ✅ | CFG000 | Hub project uses the hub process | The hub project (Project setting) is on the expected process (ExpectedProcess setting). |
 |  | ⭕ | CFG020 | All users have a corporate email | Every user identity is on the corporate domain, apart from listed partner accounts. |
 |  | ⭕ | CFG030 | No duplicate users with different emails | The same person does not appear twice under different identities. |
 |  | ⭕ | CFG035 | Users are added by group rule, not directly | Access is managed through Entra group rules rather than manual user additions. |
 |  | ⭕ | CFG040 | Spoke projects do not have Boards enabled | Spokes hold repos, pipelines, and artifacts; all work items live in the hub. |
 |  | ⭕ | CFG045 | Spoke projects keep their non-Boards services | Repos, Pipelines, Artifacts, and Test Plans stay on where a spoke uses them. |
 |  | ⭕ | CFG050 | No unexpected projects | Every project in the organization is the hub or a listed spoke (setting); anything else is flagged. |
-| Hub project | ⭕ | CFG100 | Hub project only has Boards enabled | Implemented but switched off: the Feature Management API that reports service states refuses every custom-scoped PAT (401 even with Extensions Read) and answers only to full access. Check Project settings, Overview, in the browser. |
-|  | 🧪 | CFG110 | Hub project contains no repos | No Git repos or TFVC in the hub. |
-|  | 🧪 | CFG120 | Hub project contains no pipelines | No build or release definitions in the hub. |
-|  | 🧪 | CFG130 | Hub project contains no artifact feeds | No project-scoped feeds in the hub. |
-|  | 🧪 | CFG140 | Areas defined | The area tree has nodes under the root; the note counts them and the log lists the top level. |
-|  | 🧪 | CFG150 | Iterations defined | The iteration tree has nodes under the root; the note counts them and how many are sprints. |
-|  | 🧪 | CFG160 | Iterations have dates | Every sprint (leaf iteration) has a start and a finish date. |
+| Project | ✅ | CFG100 | Project has expected services enabled | Every service in the ExpectedServices setting (comma-separated from Boards, Repos, Pipelines, Test Plans, Artifacts) is switched on in Project settings, Overview. When the Project setting names a project, only that project is held to the list. Reads the Feature Management API, which needs the hidden `vso.features` PAT scope; README.md explains how to add it. |
+|  | ✅ | CFG110 | Project does not have unexpected services enabled | No service outside ExpectedServices is switched on; the other half of CFG100, same setting, same API and scope. |
+|  | ✅ | CFG140 | Areas defined | The area tree has nodes under the root; the note counts them and the log lists the top level. |
+|  | ✅ | CFG150 | Iterations defined | The iteration tree has nodes under the root; the note counts them and how many are sprints. |
+|  | ✅ | CFG155 | Iterations follow SAFe PI naming | PIs sit directly under the root and are named YY.N (26.1); sprints sit under their PI and are named YY.N.M (26.1.2) with the PI name as the prefix; nothing goes deeper. A PI with no sprints yet is fine. |
+|  | ✅ | CFG160 | Iterations have dates | Every sprint (leaf iteration) has a start and a finish date. |
 |  | ⭕ | CFG170 | Iterations start on the agreed weekday | Sprint start day matches the cadence (setting). |
 |  | ⭕ | CFG175 | Iterations end on the agreed weekday | Sprint end day matches the cadence (setting). |
-|  | 🧪 | CFG180 | Consistent iteration lengths | Every sprint (a dated leaf iteration of SprintMaxDays or fewer) is the same number of days; the most common length is the norm and the rest are flagged. PI nodes are left out. |
+|  | ✅ | CFG180 | Consistent iteration lengths | Every sprint (a dated leaf iteration of SprintMaxDays or fewer) is the same number of days; the most common length is the norm and the rest are flagged. PI nodes are left out. |
 |  | ⭕ | CFG185 | No gaps or overlaps between iterations | Sprints are contiguous. |
 |  | ⭕ | CFG190 | Iterations exist for the current and next PI | The calendar is always one PI ahead. |
 |  | ⭕ | CFG200 | Backlog levels match the hierarchy | Epic, Feature, and Story are the only portfolio and requirement backlogs enabled. |

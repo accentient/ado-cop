@@ -1,6 +1,7 @@
 # ado-cop.ps1: runs the rules in rules.json against Azure DevOps projects.
 # Run with no arguments (F5) and Main supplies everything, with the PAT read from
-# Windows Credential Manager. The pipeline passes every value as a parameter instead.
+# Windows Credential Manager under the entry the rules file names. The pipeline passes
+# every value as a parameter instead.
 # Read-only: Invoke-AdoGet is the only network call and it hard-codes GET.
 param(
   [string]$AdoOrgUrl,
@@ -16,7 +17,7 @@ function Main {
 
   # Local defaults. Anything passed on the command line (the pipeline does this) wins.
   $script:AdoOrgUrl         = Coalesce $AdoOrgUrl      "https://dev.azure.com/<organization>/"
-  $script:AdoCredentialName = Coalesce $PatEntryName "ado-cop-PAT"
+  $script:AdoCredentialName = $PatEntryName   # empty means the PatEntryName setting in the rules file, then ado-cop-PAT
   $script:RulesFile         = Coalesce $RulesFile      (Join-Path $PSScriptRoot "rules.json")
   $script:ReportPath        = Join-Path $PSScriptRoot "ado-cop.md"   # overwritten each run
   $script:AdoToken          = $AdoToken   # pipeline only; empty means use Credential Manager
@@ -121,10 +122,10 @@ function Get-AdoOrgName {
 }
 
 function Get-AdoCredentialName {
-  if ([string]::IsNullOrWhiteSpace($script:AdoCredentialName)) {
-    throw "Set `$script:AdoCredentialName in the Main function of ado-cop.ps1 to the Credential Manager entry that holds the PAT."
-  }
-  return $script:AdoCredentialName
+  # -PatEntryName wins; otherwise the PatEntryName setting in the rules file; otherwise ado-cop-PAT.
+  if (-not [string]::IsNullOrWhiteSpace($script:AdoCredentialName)) { return $script:AdoCredentialName.Trim() }
+  if (-not $script:Rules) { $script:Rules = Read-RuleFile $script:RulesFile }
+  return [string](Get-Setting 'PatEntryName' 'ado-cop-PAT')
 }
 
 function Get-AdoPat {
@@ -202,18 +203,33 @@ function Invoke-AdoGet {
     $guard++
     if ($guard -gt 500) { throw "Paging guard tripped for $Uri" }
 
-    # The verb below is the only verb this script ever uses.
-    try {
-      $response = Invoke-WebRequest -Uri $nextUri -Headers $script:AdoHeaders -Method Get -UseBasicParsing -ErrorAction Stop
-    } catch {
-      # Some endpoints still require "-preview" on the api-version. Azure DevOps says
-      # so explicitly; when it does, retry once with the preview tag appended.
-      $bodyText = Get-AdoErrorBody $_
-      if ($bodyText -like '*VssInvalidPreviewVersionException*' -and $nextUri -match 'api-version=([\d.]+)(&|$)') {
-        $retryUri = $nextUri -replace 'api-version=([\d.]+)(&|$)', 'api-version=$1-preview$2'
-        Write-Verbose "Retrying with preview api-version: $retryUri"
-        $response = Invoke-WebRequest -Uri $retryUri -Headers $script:AdoHeaders -Method Get -UseBasicParsing -ErrorAction Stop
-      } else {
+    # The verb below is the only verb this script ever uses. Transient server answers
+    # (429 throttled, 502/503/504 unavailable; Analytics gives these now and then) are
+    # retried up to three times with a short back-off before the rule sees an error.
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
+        $response = Invoke-WebRequest -Uri $nextUri -Headers $script:AdoHeaders -Method Get -UseBasicParsing -ErrorAction Stop
+        break
+      } catch {
+        $status = $null
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+        if ($status -in 429, 502, 503, 504 -and $attempt -le 3) {
+          $delay = 2 * $attempt
+          Write-Host ("        HTTP {0}; retrying in {1}s (attempt {2} of 3)" -f $status, $delay, $attempt) -ForegroundColor DarkYellow
+          Start-Sleep -Seconds $delay
+          continue
+        }
+        # Some endpoints still require "-preview" on the api-version. Azure DevOps says
+        # so explicitly; when it does, retry once with the preview tag appended.
+        $bodyText = Get-AdoErrorBody $_
+        if ($bodyText -like '*VssInvalidPreviewVersionException*' -and $nextUri -match 'api-version=([\d.]+)(&|$)') {
+          $retryUri = $nextUri -replace 'api-version=([\d.]+)(&|$)', 'api-version=$1-preview$2'
+          Write-Verbose "Retrying with preview api-version: $retryUri"
+          $response = Invoke-WebRequest -Uri $retryUri -Headers $script:AdoHeaders -Method Get -UseBasicParsing -ErrorAction Stop
+          break
+        }
         # Put the server's own message in the exception so a rule's error result
         # says what went wrong (missing scope, bad query) rather than just "400".
         throw (Get-AdoErrorMessage $_ $bodyText)
@@ -380,6 +396,21 @@ function Get-RuleCode([string]$FunctionName) {
   return ($FunctionName -replace '^Rule_([A-Z]{3}\d{3})_.*$', '$1')
 }
 
+function Test-HubSpokeModel {
+  # HubSpokeModel setting, default on. Off keeps every rule's logic and drops the
+  # hub and spoke wording from titles, notes and item problems.
+  return [bool](Get-Setting 'HubSpokeModel' $true)
+}
+
+function Convert-HubText([string]$Text) {
+  if (-not $Text -or (Test-HubSpokeModel)) { return $Text }
+  return ($Text -creplace 'Not the hub project', 'Not the named project' `
+                -creplace 'Not the hub;', 'Not the named project;' `
+                -creplace 'Hub project', 'Project' `
+                -creplace 'hub process', 'expected process' `
+                -creplace ' in the hub', ' in the project')
+}
+
 function Get-RuleTitle([string]$RuleName) {
   # WRK110_FeaturesHaveParentEpic -> "WRK110: Features have parent epic"
   $trimmed = $RuleName -replace '^Rule_', ''
@@ -391,8 +422,9 @@ function Get-RuleTitle([string]$RuleName) {
   # Work item type names keep their capitals; states stay lower case.
   $sentence = $sentence -replace '\bepic', 'Epic' -replace '\bfeature', 'Feature' -replace '\bstor(y|ies)\b', 'Stor$1' `
     -replace '\bbug', 'Bug' -replace '\btask', 'Task' -replace '\binitiative', 'Initiative' `
-    -replace '\buser (Stor)', 'User $1' -replace '\bproduct backlog item', 'Product Backlog Item'
-  return "${code}: $sentence"
+    -replace '\buser (Stor)', 'User $1' -replace '\bproduct backlog item', 'Product Backlog Item' `
+    -replace '\bpi\b', 'PI' -replace '\bsafe\b', 'SAFe'
+  return Convert-HubText "${code}: $sentence"
 }
 
 function Add-Result {
@@ -408,6 +440,9 @@ function Add-Result {
     [object[]]$Items = @()
   )
   if ([string]::IsNullOrWhiteSpace($Note)) { $Note = $Description }
+  $Description = Convert-HubText $Description
+  $Note        = Convert-HubText $Note
+  foreach ($i in @($Items)) { if ($i.PSObject.Properties['Problem']) { $i.Problem = Convert-HubText ([string]$i.Problem) } }
   $script:Results.Add([pscustomobject]@{
     Project     = [string]$Project.name
     Rule        = $Rule
@@ -453,13 +488,13 @@ function Invoke-AdoCop {
     [string]$OutputPath
   )
 
+  $script:Rules        = Read-RuleFile $script:RulesFile   # before Connect-Ado: it may name the PAT entry
   Connect-Ado
   $script:ProjectCache = $null
   $script:PairsCache   = @{}
   $script:ProcessMap   = $null
   $script:Results      = New-Object System.Collections.Generic.List[object]
   $script:RuleTitles   = @{}
-  $script:Rules        = Read-RuleFile $script:RulesFile
 
   $ruleNames = @($script:Rules.Active)
   if ($script:Rules.TestRule) {
@@ -505,18 +540,23 @@ function Invoke-AdoCop {
   }
   $outFolder = Split-Path -Parent $OutputPath
   if ($outFolder -and -not (Test-Path $outFolder)) { New-Item -ItemType Directory -Path $outFolder | Out-Null }
-  $jsonPath = [IO.Path]::ChangeExtension($OutputPath, '.json')
+  # The Markdown report is always written. The item log (WriteLog) and the JSON for
+  # tooling (WriteJson) are settings in the rules file, both off unless switched on.
   $markdown = New-AdoCopReport -Results $script:Results -Missing $missing -Started $started
   [IO.File]::WriteAllText($OutputPath, $markdown, [Text.UTF8Encoding]::new($false))
-  $logPath = [IO.Path]::ChangeExtension($OutputPath, '.log')
-  [IO.File]::WriteAllText($logPath, (New-AdoCopLog -Results $script:Results -Started $started), [Text.UTF8Encoding]::new($false))
-  $script:Results | ConvertTo-Json -Depth 8 | Set-Content -Path $jsonPath -Encoding UTF8
+  $writeLog  = [bool](Get-Setting 'WriteLog' $false)
+  $writeJson = [bool](Get-Setting 'WriteJson' $false)
+  $logPath  = [IO.Path]::ChangeExtension($OutputPath, '.log')
+  $jsonPath = [IO.Path]::ChangeExtension($OutputPath, '.json')
+  if ($writeLog)  { [IO.File]::WriteAllText($logPath, (New-AdoCopLog -Results $script:Results -Started $started), [Text.UTF8Encoding]::new($false)) }
+  if ($writeJson) { $script:Results | ConvertTo-Json -Depth 8 | Set-Content -Path $jsonPath -Encoding UTF8 }
 
   $warnings = @($script:Results | Where-Object { $_.Status -eq $script:StatusWarning }).Count
   $errors   = @($script:Results | Where-Object { $_.Status -eq $script:StatusError }).Count
   $finished = Get-Date
   Write-Host ("Report: {0}  ({1} pass, {2} warning, {3} error)" -f $OutputPath, ($script:Results.Count - $warnings - $errors), $warnings, $errors)
-  Write-Host ("Log:    {0}" -f $logPath)
+  if ($writeLog)  { Write-Host ("Log:    {0}" -f $logPath) }
+  if ($writeJson) { Write-Host ("JSON:   {0}" -f $jsonPath) }
   Write-Host ""
   Write-Host ("Ending {0}" -f $finished.ToString('HH:mm:ss')) -ForegroundColor Cyan
   if ($env:TF_BUILD -and ($warnings + $errors) -gt 0) {
@@ -622,12 +662,15 @@ function Get-ProjectProcessName($Project) {
 }
 
 # Project services, by the feature id the Feature Management API uses.
+# Feature ids behind Project settings, Overview. Artifacts is ms.azure-artifacts.feature;
+# ms.feed.feed exists too but is never set by the toggle (always "undefined"), so reading
+# it reports Artifacts as on in projects where it is off.
 $script:ProjectServices = [ordered]@{
   'Boards'     = 'ms.vss-work.agile'
   'Repos'      = 'ms.vss-code.version-control'
   'Pipelines'  = 'ms.vss-build.pipelines'
   'Test Plans' = 'ms.vss-test-web.test'
-  'Artifacts'  = 'ms.feed.feed'
+  'Artifacts'  = 'ms.azure-artifacts.feature'
 }
 
 function Get-ProjectServiceStates($Project) {
@@ -677,20 +720,20 @@ function New-NamedItem([string]$Type, [string]$Title, [string]$Problem, [string]
 }
 
 function Test-IsHub($Project) {
-  $hub = [string](Get-Setting 'HubProject' '')
+  $hub = [string](Get-Setting 'Project' '')
   return (-not [string]::IsNullOrWhiteSpace($hub) -and [string]$Project.name -ieq $hub)
 }
 
 # ---- Organization
 function Rule_CFG000_HubProjectUsesHubProcess {
-  # The hub project (HubProject setting) is on the hub process (HubProcess setting).
+  # The hub project (Project setting) is on the expected process (ExpectedProcess setting).
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $hub = [string](Get-Setting 'HubProject' '')
-  $want = [string](Get-Setting 'HubProcess' '')
+  $hub = [string](Get-Setting 'Project' '')
+  $want = [string](Get-Setting 'ExpectedProcess' '')
   $have = Get-ProjectProcessName $Project
   if ([string]::IsNullOrWhiteSpace($hub) -or [string]::IsNullOrWhiteSpace($want)) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No HubProject or HubProcess setting in the rules file; nothing to check." -Note "No hub settings"
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No Project or ExpectedProcess setting in the rules file; nothing to check." -Note "No Project or ExpectedProcess setting"
     return
   }
   if (-not (Test-IsHub $Project)) {
@@ -705,88 +748,80 @@ function Rule_CFG000_HubProjectUsesHubProcess {
   }
 }
 
-# ---- Hub project
-function Rule_CFG100_HubProjectOnlyHasBoardsEnabled {
-  # Boards on; Repos, Pipelines, Test Plans and Artifacts off in the hub.
-  param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+# ---- Project services
+function Get-ExpectedServicesContext($Project, [string]$Code) {
+  # Shared by CFG100 and CFG110. Reads the ExpectedServices setting (comma-separated:
+  # Boards, Repos, Pipelines, Test Plans, Artifacts) and the project's service states.
+  # Returns @{ Expected; On; OnText } when the rule should compare them, or $null after
+  # recording the result itself: a red row for a bad setting or an unreadable API, a
+  # green row when there is no setting or this is not the project named in Project.
+  $known = @($script:ProjectServices.Keys)
+  $expected = @(Get-SettingList 'ExpectedServices' @())
+  $unknown = @($expected | Where-Object { $known -notcontains $_ })
+  if ($unknown.Count -gt 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusError `
+      -Description "Unknown service in ExpectedServices: $($unknown -join ', '). Use: $($known -join ', ')." `
+      -Note "Unknown service in ExpectedServices: $($unknown -join ', ')"
+    return $null
+  }
+  $expected = @($expected | ForEach-Object { $e = $_; $known | Where-Object { $_ -ieq $e } })   # canonical casing
   try {
     $states = Get-ProjectServiceStates $Project
   } catch {
-    # The Feature Management API is not listed under any custom PAT scope. Extensions
-    # (Read) is the closest candidate; if that still fails, switch this rule off and
-    # check Project settings, Overview, in the browser.
-    Add-Result -Project $Project -Rule $code -Status $script:StatusError `
-      -Description "Cannot read the project's service states with this PAT ($($_.Exception.Message)). Try adding the Extensions (Read) scope; if it still fails, switch CFG100 off and check Project settings, Overview, in the browser." `
-      -Note "PAT cannot read service states; try the Extensions (Read) scope"
-    return
+    # The Feature Management API is gated by the vso.features scope, which the token page
+    # never shows: a PAT without it gets a bare 401 whatever else is ticked (verified 24
+    # Sep 2026). tools\Add-PatFeaturesScope.ps1 adds the scope to an existing PAT through
+    # the PAT lifecycle API. Otherwise switch these rules off, or check the services in
+    # Project settings, Overview, in the browser. README.md tells the whole story.
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusError `
+      -Description "Cannot read the project's service states with this PAT ($($_.Exception.Message)). The Feature Management API needs the hidden vso.features scope; add it with tools\Add-PatFeaturesScope.ps1, or switch $Code off and check Project settings, Overview, in the browser." `
+      -Note "PAT lacks the vso.features scope; see tools\Add-PatFeaturesScope.ps1"
+    return $null
   }
   $on = @($states.Keys | Where-Object { $states[$_] })
-  if (-not (Test-IsHub $Project)) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the hub project; services on: $($on -join ', ')." -Note "Not the hub; on: $($on -join ', ')"
-    return
+  $onText = if ($on.Count -gt 0) { $on -join ', ' } else { 'none' }
+  $named = [string](Get-Setting 'Project' '')
+  $applies = [string]::IsNullOrWhiteSpace($named) -or ([string]$Project.name -ieq $named)
+  if ($expected.Count -eq 0 -or -not $applies) {
+    $why = if ($expected.Count -eq 0) { "No ExpectedServices setting" } else { "Not the named project ($named)" }
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "$why; services on: $onText." -Note "$why; on: $onText"
+    return $null
   }
-  $extra = @($on | Where-Object { $_ -ne 'Boards' })
-  if ($states['Boards'] -and $extra.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Only Boards is enabled." -Note "Only Boards is enabled"
-    return
-  }
-  $items = @($extra | ForEach-Object { New-NamedItem 'Service' $_ 'Enabled in the hub' })
-  if (-not $states['Boards']) { $items += New-NamedItem 'Service' 'Boards' 'Disabled in the hub' }
-  $note = if ($extra.Count -gt 0) { "$(Format-Count $extra.Count 'extra service' 'extra services') enabled: $($extra -join ', ')" } else { "Boards is disabled" }
-  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning -Description "$note." -Note $note -Items $items
+  return @{ Expected = $expected; On = $on; OnText = $onText }
 }
 
-function Rule_CFG110_HubProjectContainsNoRepos {
-  # No Git repositories and no TFVC in the hub.
+function Rule_CFG100_ProjectHasExpectedServicesEnabled {
+  # Every service listed in ExpectedServices is switched on in Project settings, Overview.
+  # CFG110 is the other half: nothing outside the list is on.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $items = New-Object System.Collections.Generic.List[object]
-  $repos = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/git/repositories?api-version=$($script:ApiVersion)")
-  foreach ($r in @($repos.value)) { $items.Add((New-NamedItem 'Git repository' ([string]$r.name) 'Repository in the hub' ([string]$r.webUrl))) }
-  try {
-    $tfvc = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/tfvc/items?scopePath=" + [uri]::EscapeDataString('$/' + $Project.name) + "&recursionLevel=None&api-version=$($script:ApiVersion)")
-    if ($tfvc.value -and @($tfvc.value).Count -gt 0) { $items.Add((New-NamedItem 'TFVC' ('$/' + $Project.name) 'TFVC root in the hub')) }
-  } catch { }   # 404 means no TFVC
-  if (-not (Test-IsHub $Project)) {
-    $n = $items.Count
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the hub project; $(Format-Count $n 'repository' 'repositories')." -Note "Not the hub; $(Format-Count $n 'repository' 'repositories')"
+  $ctx = Get-ExpectedServicesContext $Project $code
+  if (-not $ctx) { return }
+  $missing = @($ctx.Expected | Where-Object { $ctx.On -notcontains $_ })
+  if ($missing.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Every expected service is on: $($ctx.Expected -join ', ')." -Note "On: $($ctx.Expected -join ', ')"
     return
   }
-  Add-CountResult -Project $Project -RuleCode $code -Items $items.ToArray() -PassNote "No repositories" -Singular "repository in the hub" -Plural "repositories in the hub"
+  $items = @($missing | ForEach-Object { New-NamedItem 'Service' $_ 'In ExpectedServices but switched off' })
+  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
+    -Description "Services on: $($ctx.OnText). Expected: $($ctx.Expected -join ', '). Missing: $($missing -join ', ')." -Note "Missing: $($missing -join ', ')" -Items $items
 }
 
-function Rule_CFG120_HubProjectContainsNoPipelines {
-  # No build definitions and no classic release definitions in the hub.
+function Rule_CFG110_ProjectDoesNotHaveUnexpectedServicesEnabled {
+  # No service outside ExpectedServices is switched on in Project settings, Overview.
+  # CFG100 is the other half: everything in the list is on.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $items = New-Object System.Collections.Generic.List[object]
-  $builds = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/build/definitions?api-version=$($script:ApiVersion)") -AllPages
-  foreach ($d in @($builds)) { $items.Add((New-NamedItem 'Build pipeline' ([string]$d.name) 'Pipeline in the hub' $null ([int]$d.id))) }
-  try {
-    $releases = Invoke-AdoGet -Uri ($script:ReleaseBase + "$($Project.id)/_apis/release/definitions?api-version=$($script:ApiVersion)") -AllPages
-    foreach ($d in @($releases)) { $items.Add((New-NamedItem 'Release pipeline' ([string]$d.name) 'Release pipeline in the hub' $null ([int]$d.id))) }
-  } catch { }   # Release scope missing: builds still counted
-  if (-not (Test-IsHub $Project)) {
-    $n = $items.Count
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the hub project; $(Format-Count $n 'pipeline')." -Note "Not the hub; $(Format-Count $n 'pipeline')"
+  $ctx = Get-ExpectedServicesContext $Project $code
+  if (-not $ctx) { return }
+  $extra = @($ctx.On | Where-Object { $ctx.Expected -notcontains $_ })
+  if ($extra.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Nothing on beyond ExpectedServices; services on: $($ctx.OnText)." -Note "No unexpected services on"
     return
   }
-  Add-CountResult -Project $Project -RuleCode $code -Items $items.ToArray() -PassNote "No pipelines" -Singular "pipeline in the hub" -Plural "pipelines in the hub"
-}
-
-function Rule_CFG130_HubProjectContainsNoArtifactFeeds {
-  # No project-scoped artifact feeds in the hub.
-  param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $feeds = Invoke-AdoGet -Uri ($script:FeedsBase + "$($Project.id)/_apis/packaging/feeds?api-version=$($script:ApiVersion)-preview.1")
-  $items = @(@($feeds.value) | ForEach-Object { New-NamedItem 'Feed' ([string]$_.name) 'Feed in the hub' })
-  if (-not (Test-IsHub $Project)) {
-    $n = $items.Count
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the hub project; $(Format-Count $n 'artifact feed')." -Note "Not the hub; $(Format-Count $n 'artifact feed')"
-    return
-  }
-  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No artifact feeds" -Singular "artifact feed in the hub" -Plural "artifact feeds in the hub"
+  $items = @($extra | ForEach-Object { New-NamedItem 'Service' $_ 'Enabled but not in ExpectedServices' })
+  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
+    -Description "Services on: $($ctx.OnText). Expected: $($ctx.Expected -join ', '). Unexpected: $($extra -join ', ')." -Note "Unexpected: $($extra -join ', ')" -Items $items
 }
 
 function Rule_CFG140_AreasDefined {
@@ -819,6 +854,37 @@ function Rule_CFG150_IterationsDefined {
   Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
     -Description ("{0} defined, {1} of them leaf nodes." -f (Format-Count $rows.Count 'iteration'), $leaves.Count) `
     -Note (Format-Count $rows.Count 'iteration defined' 'iterations defined')
+}
+
+function Rule_CFG155_IterationsFollowSafePiNaming {
+  # The iteration tree is SAFe-shaped: PIs sit directly under the root and are named YY.N
+  # (26.1), sprints sit under their PI and are named YY.N.M (26.1.2) with the PI's name as
+  # the prefix, and nothing goes deeper. A PI with no sprints yet is fine.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = @(Get-TreeNodes (Get-ClassificationTree $Project 'iteration'))
+  if ($rows.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No iterations under the root; nothing to check." -Note "No iterations to check"
+    return
+  }
+  $items = @(foreach ($row in $rows) {
+    $name = [string]$row.Node.name
+    $problem = switch ($row.Depth) {
+      1 { if ($name -notmatch '^\d{2}\.[1-9]\d?$') { "PI is not named YY.N" } }
+      2 {
+        $pi = $row.Path.Split('\')[-2]
+        if ($name -notmatch '^\d{2}\.[1-9]\d?\.[1-9]\d?$') { "Sprint is not named YY.N.M" }
+        elseif (-not $name.StartsWith("$pi.")) { "Sprint is not numbered under its PI $pi" }
+      }
+      default { "Nested deeper than PI and sprint" }
+    }
+    if ($problem) { New-NodeItem $Project $row 'Iteration' $problem }
+  })
+  $pis     = @($rows | Where-Object { $_.Depth -eq 1 }).Count
+  $sprints = @($rows | Where-Object { $_.Depth -eq 2 }).Count
+  Add-CountResult -Project $Project -RuleCode $code -Items $items `
+    -PassNote ("Every iteration follows the SAFe pattern ({0}, {1})" -f (Format-Count $pis 'PI'), (Format-Count $sprints 'sprint')) `
+    -Singular "iteration breaks the SAFe naming pattern" -Plural "iterations break the SAFe naming pattern"
 }
 
 function Rule_CFG160_IterationsHaveDates {
@@ -1407,8 +1473,10 @@ function Get-StatusGlyph([string]$Status) {
 
 function New-AdoCopLog {
   # Companion to the report: every warning and error with the actual items behind it,
-  # grouped by rule in the same order as the report table.
+  # grouped by rule in the same order as the report table. Each rule lists at most
+  # MaxLogItems items (setting, default 50; 0 means all); the JSON always holds them all.
   param($Results, [datetime]$Started)
+  $max = [int](Get-Setting 'MaxLogItems' 50)
   $sb = New-Object System.Text.StringBuilder
   $add = { param($line) [void]$sb.AppendLine($line) }
   $projects = @($Results | ForEach-Object { $_.Project } | Select-Object -Unique)
@@ -1424,12 +1492,17 @@ function New-AdoCopLog {
     & $add ""
     $where = if ($projects.Count -gt 1) { " ($($r.Project))" } else { "" }
     & $add "Rule: $($r.Title)$where  [$($r.Status)]  $($r.Description)"
-    if (@($r.Items).Count -eq 0) { continue }
-    foreach ($i in $r.Items) {
+    $items = @($r.Items)
+    if ($items.Count -eq 0) { continue }
+    $shown = if ($max -gt 0 -and $items.Count -gt $max) { $items[0..($max - 1)] } else { $items }
+    foreach ($i in $shown) {
       $problem = [string]$i.Problem
       if ($i.ParentId -and $problem -notmatch "\b$($i.ParentId)\b") { $problem += " (parent $($i.ParentId))" }
       $area = if ($i.AreaPath) { "  $($i.AreaPath)" } else { "" }
       & $add ("  {0,-20} {1,7}  {2,-10}  {3}  |  {4}{5}" -f $i.Type, $i.Id, $i.State, $problem, $i.Title, $area)
+    }
+    if ($items.Count -gt @($shown).Count) {
+      & $add ("  ... and {0} more, {1} in all. Set MaxLogItems to 0 to list every item, or WriteJson for the full data." -f ($items.Count - @($shown).Count), $items.Count)
     }
   }
   return $sb.ToString()
