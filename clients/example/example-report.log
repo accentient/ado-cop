@@ -1,0 +1,31 @@
+ado-cop log, contoso, 2026-09-25 08:00. Warnings and errors only; the summary is ado-cop.md.
+
+Rule: CFG122: Hub project does not have unexpected services enabled  [Warning]  1 unexpected service is on across the hub project (Hub: Repos). Services on: Hub: Boards, Repos.
+  Service                    0              Enabled in Hub but not in ExpectedHubServices  |  Hub: Repos
+
+Rule: CFG307: No unexpected teams present  [Warning]  1 unexpected team is present (Tiger Team).
+  Team                       0              In the project but not in ExpectedTeams  |  Tiger Team
+
+Rule: WRK110: Closed Epics have no open children  [Warning]  3 open Features sit under closed Epics (Feature: 3).
+  Feature                 1042  New         Parent Epic 1001 is Closed  |  Statement redesign, phase 2  Hub\Payments
+  Feature                 1057  Active      Parent Epic 1001 is Closed  |  Statement archive export  Hub\Payments
+  Feature                 1088  New         Parent Epic 1009 is Closed  |  Loan origination audit trail  Hub\Lending
+
+Rule: WRK130: Epics with active child are active  [Warning]  New Epics found with active children: 2.
+  Epic                    1015  New         New while child Feature 1061 is Active  |  Card controls
+  Epic                    1021  New         New while child Feature 1077 is Active  |  Member onboarding
+
+Rule: WRK360: Sprint Stories have a description and acceptance criteria  [Warning]  2 sprint Stories lack a description or acceptance criteria (User Story: 2).
+  User Story              2210  Active      No acceptance criteria  |  Show pending transfers on the dashboard  Hub\Payments
+  User Story              2231  New         No description or acceptance criteria  |  Rate sheet import  Hub\Lending
+
+Rule: WRK530: Sprint Tasks have remaining work  [Warning]  4 current-sprint Tasks have no Remaining Work.
+  Task                    3301  To Do       No Remaining Work in Hub\26.3\26.3.2  |  Write migration script  Hub\Payments
+  Task                    3302  To Do       No Remaining Work in Hub\26.3\26.3.2  |  Review with security  Hub\Payments
+  Task                    3318  In Progress  No Remaining Work in Hub\26.3\26.3.2  |  Update API docs  Hub\Lending
+  Task                    3319  To Do       No Remaining Work in Hub\26.3\26.3.2  |  Load test  Hub\Lending
+
+Rule: WRK815: Epics and Features have an owner  [Warning]  3 open Epics and Features are not assigned to a Product Owner (Epic: 1, Feature: 2).
+  Epic                    1021  New         New with nobody assigned  |  Member onboarding
+  Feature                 1042  New         Assigned to Alex Developer, not a Product Owner  |  Statement redesign, phase 2  Hub\Payments
+  Feature                 1088  New         New with nobody assigned  |  Loan origination audit trail  Hub\Lending

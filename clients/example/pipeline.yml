@@ -1,0 +1,49 @@
+# Runs ado-cop.ps1 against the Contoso organization on a schedule and publishes the report
+# as a pipeline artifact. Copy this file into a client folder and edit -Projects and -RulesFile.
+#
+# Setup in Azure DevOps:
+#   1. Create a pipeline from this file.
+#   2. Add a secret variable named adoToken holding a PAT with the Read scopes listed
+#      in README.md. The pipeline's own $(System.AccessToken) also works if the build
+#      identity has been given access to every project below; swap it in for $(adoToken).
+#   3. Edit the -Projects list. The report, its .log and its .json all land in the artifact.
+
+trigger: none
+pr: none
+schedules:
+  - cron: "0 13 * * 1-5"   # 13:00 UTC, weekdays
+    displayName: "Weekday morning"
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+jobs:
+- job: AdoCop
+  displayName: 'ado-cop'
+  steps:
+  - checkout: self
+    fetchDepth: 1
+
+  - task: PowerShell@2
+    displayName: 'Run ado-cop.ps1'
+    inputs:
+      targetType: 'filePath'
+      filePath: '$(Build.SourcesDirectory)/ado-cop.ps1'
+      pwsh: true
+      arguments: >
+        -AdoOrgUrl '$(System.CollectionUri)'
+        -AdoToken '$(adoToken)'
+        -Projects 'Hub'
+        -RulesFile '$(Build.SourcesDirectory)/clients/example/rules.json'
+        -OutputPath '$(Build.ArtifactStagingDirectory)/ado-cop.md'
+
+  - task: PublishPipelineArtifact@1
+    displayName: 'Publish report'
+    condition: succeededOrFailed()
+    inputs:
+      targetPath: '$(Build.ArtifactStagingDirectory)'
+      artifact: 'ado-cop'

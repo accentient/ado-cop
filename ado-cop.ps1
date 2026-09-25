@@ -392,27 +392,12 @@ function Get-SettingList([string]$Name, [string[]]$Default = @()) {
 }
 
 function Get-RuleCode([string]$FunctionName) {
-  # Rule_WRK110_FeaturesHaveParentEpic -> WRK110
+  # Rule_WRK200_FeaturesHaveParentEpic -> WRK200
   return ($FunctionName -replace '^Rule_([A-Z]{3}\d{3})_.*$', '$1')
 }
 
-function Test-HubSpokeModel {
-  # HubSpokeModel setting, default on. Off keeps every rule's logic and drops the
-  # hub and spoke wording from titles, notes and item problems.
-  return [bool](Get-Setting 'HubSpokeModel' $true)
-}
-
-function Convert-HubText([string]$Text) {
-  if (-not $Text -or (Test-HubSpokeModel)) { return $Text }
-  return ($Text -creplace 'Not the hub project', 'Not the named project' `
-                -creplace 'Not the hub;', 'Not the named project;' `
-                -creplace 'Hub project', 'Project' `
-                -creplace 'hub process', 'expected process' `
-                -creplace ' in the hub', ' in the project')
-}
-
 function Get-RuleTitle([string]$RuleName) {
-  # WRK110_FeaturesHaveParentEpic -> "WRK110: Features have parent epic"
+  # WRK200_FeaturesHaveParentEpic -> "WRK200: Features have parent epic"
   $trimmed = $RuleName -replace '^Rule_', ''
   $code, $namePart = $trimmed -split '_', 2
   if (-not $namePart) { return $trimmed }
@@ -424,7 +409,7 @@ function Get-RuleTitle([string]$RuleName) {
     -replace '\bbug', 'Bug' -replace '\btask', 'Task' -replace '\binitiative', 'Initiative' `
     -replace '\buser (Stor)', 'User $1' -replace '\bproduct backlog item', 'Product Backlog Item' `
     -replace '\bpi\b', 'PI' -replace '\bsafe\b', 'SAFe'
-  return Convert-HubText "${code}: $sentence"
+  return "${code}: $sentence"
 }
 
 function Add-Result {
@@ -440,9 +425,6 @@ function Add-Result {
     [object[]]$Items = @()
   )
   if ([string]::IsNullOrWhiteSpace($Note)) { $Note = $Description }
-  $Description = Convert-HubText $Description
-  $Note        = Convert-HubText $Note
-  foreach ($i in @($Items)) { if ($i.PSObject.Properties['Problem']) { $i.Problem = Convert-HubText ([string]$i.Problem) } }
   $script:Results.Add([pscustomobject]@{
     Project     = [string]$Project.name
     Rule        = $Rule
@@ -493,6 +475,8 @@ function Invoke-AdoCop {
   $script:ProjectCache = $null
   $script:PairsCache   = @{}
   $script:ProcessMap   = $null
+  $script:TeamCache    = @{}
+  $script:TypeFieldCache = @{}
   $script:Results      = New-Object System.Collections.Generic.List[object]
   $script:RuleTitles   = @{}
 
@@ -521,6 +505,7 @@ function Invoke-AdoCop {
 
   $started = Get-Date
   $script:TargetCount = $targets.Count
+  $script:Targets     = $targets.ToArray()
   Write-Host ("Started {0}" -f $started.ToString('HH:mm:ss')) -ForegroundColor Cyan
   Write-Host ""
   Write-Host ("Running rules from {0}" -f (Split-Path -Leaf $script:RulesFile))
@@ -612,6 +597,46 @@ function Get-WorkItemFields {
     foreach ($wi in @($page.value)) { $map[[int]$wi.id] = $wi.fields }
   }
   return $map
+}
+
+function Get-WorkItemRelations {
+  # Relations (parent, child, Tested By, ...) for a set of IDs through the work items REST
+  # API (GET, 200 IDs per call, $expand=relations). Hashtable keyed by ID; an item with no
+  # relations maps to an empty array.
+  param([Parameter(Mandatory = $true)][int[]]$Ids)
+  $map = @{}
+  $unique = @($Ids | Where-Object { $_ } | Select-Object -Unique)
+  for ($i = 0; $i -lt $unique.Count; $i += 200) {
+    $batch = $unique[$i..([Math]::Min($i + 199, $unique.Count - 1))]
+    $uri = $script:CoreBase + "_apis/wit/workitems?ids=" + ($batch -join ',') +
+           "&`$expand=relations&errorPolicy=omit&api-version=$($script:ApiVersion)"
+    $page = Invoke-AdoGet -Uri $uri
+    foreach ($wi in @($page.value)) { $map[[int]$wi.id] = if ($wi.relations) { @($wi.relations) } else { @() } }
+  }
+  return $map
+}
+
+function Get-WorkItemTypeFieldNames($Project, [string]$Type) {
+  # Reference names of the fields on a work item type, cached per project and type. A type
+  # the process does not have (User Story on Scrum) yields an empty list.
+  if (-not $script:TypeFieldCache) { $script:TypeFieldCache = @{} }
+  $key = "$($Project.id)|$Type"
+  if (-not $script:TypeFieldCache.ContainsKey($key)) {
+    $names = @()
+    try {
+      $r = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/wit/workitemtypes/$([uri]::EscapeDataString($Type))/fields?api-version=$($script:ApiVersion)")
+      $names = @($r.value | ForEach-Object { [string]$_.referenceName })
+    } catch { }
+    $script:TypeFieldCache[$key] = $names
+  }
+  return $script:TypeFieldCache[$key]
+}
+
+function Test-HasText([string]$Html) {
+  # True when an HTML field holds something beyond tags, entities and whitespace.
+  if ([string]::IsNullOrWhiteSpace($Html)) { return $false }
+  $text = $Html -replace '<[^>]+>', '' -replace '&nbsp;', ' ' -replace '&#160;', ' '
+  return -not [string]::IsNullOrWhiteSpace($text)
 }
 
 function Get-WorkItemUrl($Project, $Id) {
@@ -719,54 +744,132 @@ function New-NamedItem([string]$Type, [string]$Title, [string]$Problem, [string]
   [pscustomobject]@{ Id = $Id; Type = $Type; Title = $Title; State = ""; AreaPath = ""; Problem = $Problem; ParentId = $null; ParentType = $null; Url = $Url }
 }
 
-function Test-IsHub($Project) {
-  $hub = [string](Get-Setting 'Project' '')
-  return (-not [string]::IsNullOrWhiteSpace($hub) -and [string]$Project.name -ieq $hub)
+function Get-ProjectModel {
+  # ProjectModel setting: Standard (one project holds work and code; CFG000, CFG100, CFG110)
+  # or HubSpoke (a hub holds the work items, spokes hold the code; CFG002, CFG004, CFG120
+  # to CFG132). Each family of rules checks it belongs to the model in force.
+  $model = [string](Get-Setting 'ProjectModel' 'Standard')
+  if ($model -ieq 'HubSpoke') { return 'HubSpoke' }
+  return 'Standard'
 }
 
-# ---- Organization
-function Rule_CFG000_HubProjectUsesHubProcess {
-  # The hub project (Project setting) is on the expected process (ExpectedProcess setting).
+function Test-ProjectModel($Project, [string]$Code, [string]$Model) {
+  # True when the rule belongs to the model in force; otherwise records a red row and
+  # returns false, so a rules file with the wrong family switched on says so.
+  $have = Get-ProjectModel
+  if ($have -eq $Model) { return $true }
+  Add-Result -Project $Project -Rule $Code -Status $script:StatusError `
+    -Description "$Code belongs to the $Model project model, but ProjectModel is $have. Switch the rule off or change the setting." `
+    -Note "Belongs to the $Model model; ProjectModel is $have"
+  return $false
+}
+
+function Test-FirstTarget($Project) {
+  # Organization-level rules read named projects from the settings rather than the project
+  # being inspected, so they run once, with the first inspected project, not once per project.
+  return ([string]$Project.id -eq [string]$script:Targets[0].id)
+}
+
+function Get-NamedProject([string]$Name) {
+  # The project object for a name in the settings, or $null when the organization has none.
+  return (Get-AdoAllProjects | Where-Object { [string]$_.name -ieq $Name } | Select-Object -First 1)
+}
+
+# ---- Organization: process (CFG000 Standard; CFG002 and CFG004 HubSpoke)
+function Rule_CFG000_ProjectUsesExpectedProcess {
+  # Standard model. The project named in Project (or every inspected project when Project
+  # is empty) is on the ExpectedProcess process.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $hub = [string](Get-Setting 'Project' '')
-  $want = [string](Get-Setting 'ExpectedProcess' '')
+  if (-not (Test-ProjectModel $Project $code 'Standard')) { return }
+  $named = [string](Get-Setting 'Project' '')
   $have = Get-ProjectProcessName $Project
-  if ([string]::IsNullOrWhiteSpace($hub) -or [string]::IsNullOrWhiteSpace($want)) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No Project or ExpectedProcess setting in the rules file; nothing to check." -Note "No Project or ExpectedProcess setting"
+  if ($named -and [string]$Project.name -ine $named) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the named project ($named); $($Project.name) uses $have." -Note "Not the named project ($named); $($Project.name) uses $have"
     return
   }
-  if (-not (Test-IsHub $Project)) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Not the hub project ($hub); on the $have process." -Note "Not the hub; on $have"
+  $want = [string](Get-Setting 'ExpectedProcess' '')
+  if ([string]::IsNullOrWhiteSpace($want)) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No ExpectedProcess setting in the rules file; $($Project.name) uses $have." -Note "No ExpectedProcess setting; $($Project.name) uses $have"
     return
   }
   if ($have -ieq $want) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "$hub is on the $want process." -Note "On the $want process"
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "$($Project.name) uses $want." -Note "$($Project.name) uses $want"
   } else {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusWarning -Description "$hub is on the $have process, not $want." -Note "On $have, not $want" `
-      -Items @(New-NamedItem 'Project' $hub "Process is $have, expected $want")
+    Add-Result -Project $Project -Rule $code -Status $script:StatusWarning -Description "$($Project.name) uses $have, expected $want." -Note "$($Project.name) uses $have, expected $want" `
+      -Items @(New-NamedItem 'Project' ([string]$Project.name) "Process is $have, expected $want")
   }
 }
 
-# ---- Project services
-function Get-ExpectedServicesContext($Project, [string]$Code) {
-  # Shared by CFG100 and CFG110. Reads the ExpectedServices setting (comma-separated:
-  # Boards, Repos, Pipelines, Test Plans, Artifacts) and the project's service states.
-  # Returns @{ Expected; On; OnText } when the rule should compare them, or $null after
-  # recording the result itself: a red row for a bad setting or an unreadable API, a
-  # green row when there is no setting or this is not the project named in Project.
+function Test-NamedProjectsProcess {
+  # Shared by CFG002 and CFG004: every project named in the setting is on the expected
+  # process. Runs once per run, not once per inspected project.
+  param($Project, [string]$Code, [string]$ProjectSetting, [string]$ProcessSetting, [string]$Label, [string]$Plural)
+  if (-not (Test-ProjectModel $Project $Code 'HubSpoke')) { return }
+  if (-not (Test-FirstTarget $Project)) { return }
+  $names = @(Get-SettingList $ProjectSetting @())
+  $want = [string](Get-Setting $ProcessSetting '')
+  if ($names.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusError -Description "No $ProjectSetting setting in the rules file; name the $Plural or switch $Code off." -Note "No $ProjectSetting setting"
+    return
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  $uses = @()
+  foreach ($name in $names) {
+    $p = Get-NamedProject $name
+    if (-not $p) { $items.Add((New-NamedItem 'Project' $name "Not found in the organization (check $ProjectSetting or PAT access)")); continue }
+    $have = Get-ProjectProcessName $p
+    $uses += "$($p.name) uses $have"
+    if ($want -and $have -ine $want) { $items.Add((New-NamedItem 'Project' ([string]$p.name) "Process is $have, expected $want")) }
+  }
+  $usesText = $uses -join ', '
+  if ([string]::IsNullOrWhiteSpace($want) -and $items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No $ProcessSetting setting in the rules file; $usesText." -Note "No $ProcessSetting setting; $usesText"
+    return
+  }
+  # "IT, Foo1, Foo2 all use CWI Scrum" when they agree; otherwise each project by name.
+  $processes = @($uses | ForEach-Object { ($_ -split ' uses ', 2)[1] } | Select-Object -Unique)
+  $summary = if ($uses.Count -gt 1 -and $processes.Count -eq 1) { "$(($uses | ForEach-Object { ($_ -split ' uses ', 2)[0] }) -join ', ') all use $($processes[0])" } else { $usesText }
+  if ($items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "$summary." -Note $summary
+    return
+  }
+  Add-Result -Project $Project -Rule $Code -Status $script:StatusWarning -Description "$summary; expected $want." -Note "$summary, expected $want" -Items $items.ToArray()
+}
+
+function Rule_CFG002_HubProjectUsesExpectedProcess {
+  # HubSpoke model. The HubProject is on the ExpectedHubProcess process.
+  param($Project)
+  Test-NamedProjectsProcess -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'HubProject' -ProcessSetting 'ExpectedHubProcess' -Label 'hub' -Plural 'hub project'
+}
+
+function Rule_CFG004_SpokeProjectsUseExpectedProcess {
+  # HubSpoke model. Every project in SpokeProjects is on the ExpectedSpokeProcess process.
+  param($Project)
+  Test-NamedProjectsProcess -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'SpokeProjects' -ProcessSetting 'ExpectedSpokeProcess' -Label 'spoke' -Plural 'spoke projects'
+}
+
+# ---- Project services (CFG100, CFG110 Standard; CFG120 to CFG132 HubSpoke)
+function Resolve-ServiceNames($Project, [string]$Code, [string]$Setting) {
+  # The comma-separated services in a setting with canonical casing, or $null after a red
+  # row for a name that is not one of Boards, Repos, Pipelines, Test Plans, Artifacts.
   $known = @($script:ProjectServices.Keys)
-  $expected = @(Get-SettingList 'ExpectedServices' @())
+  $expected = @(Get-SettingList $Setting @())
   $unknown = @($expected | Where-Object { $known -notcontains $_ })
   if ($unknown.Count -gt 0) {
     Add-Result -Project $Project -Rule $Code -Status $script:StatusError `
-      -Description "Unknown service in ExpectedServices: $($unknown -join ', '). Use: $($known -join ', ')." `
-      -Note "Unknown service in ExpectedServices: $($unknown -join ', ')"
+      -Description "Unknown service in ${Setting}: $($unknown -join ', '). Use: $($known -join ', ')." -Note "Unknown service in ${Setting}: $($unknown -join ', ')"
     return $null
   }
-  $expected = @($expected | ForEach-Object { $e = $_; $known | Where-Object { $_ -ieq $e } })   # canonical casing
+  return ,@($expected | ForEach-Object { $e = $_; $known | Where-Object { $_ -ieq $e } })
+}
+
+function Get-ServicesOn($Project, [string]$Code, $Target = $null) {
+  # The services switched on in Target (the inspected Project when omitted), or $null after
+  # a red row, recorded against the inspected project, when the API refuses.
+  if ($null -eq $Target) { $Target = $Project }
   try {
-    $states = Get-ProjectServiceStates $Project
+    $states = Get-ProjectServiceStates $Target
   } catch {
     # The Feature Management API is gated by the vso.features scope, which the token page
     # never shows: a PAT without it gets a bare 401 whatever else is ticked (verified 24
@@ -774,54 +877,140 @@ function Get-ExpectedServicesContext($Project, [string]$Code) {
     # the PAT lifecycle API. Otherwise switch these rules off, or check the services in
     # Project settings, Overview, in the browser. README.md tells the whole story.
     Add-Result -Project $Project -Rule $Code -Status $script:StatusError `
-      -Description "Cannot read the project's service states with this PAT ($($_.Exception.Message)). The Feature Management API needs the hidden vso.features scope; add it with tools\Add-PatFeaturesScope.ps1, or switch $Code off and check Project settings, Overview, in the browser." `
+      -Description "Cannot read the service states of $($Target.name) with this PAT ($($_.Exception.Message)). The Feature Management API needs the hidden vso.features scope; add it with tools\Add-PatFeaturesScope.ps1, or switch $Code off and check Project settings, Overview, in the browser." `
       -Note "PAT lacks the vso.features scope; see tools\Add-PatFeaturesScope.ps1"
     return $null
   }
-  $on = @($states.Keys | Where-Object { $states[$_] })
-  $onText = if ($on.Count -gt 0) { $on -join ', ' } else { 'none' }
+  return ,@($states.Keys | Where-Object { $states[$_] })
+}
+
+function Format-ServicesOn($On) {
+  if (@($On).Count -gt 0) { return (@($On) -join ', ') }
+  return 'none'
+}
+
+function Test-StandardServicesRule {
+  # Shared by CFG100 and CFG110. Standard model: the project named in Project (or every
+  # inspected project) against ExpectedServices. Mode is Missing (listed but off) or Extra
+  # (on but not listed).
+  param($Project, [string]$Code, [string]$Mode)
+  if (-not (Test-ProjectModel $Project $Code 'Standard')) { return }
   $named = [string](Get-Setting 'Project' '')
-  $applies = [string]::IsNullOrWhiteSpace($named) -or ([string]$Project.name -ieq $named)
-  if ($expected.Count -eq 0 -or -not $applies) {
-    $why = if ($expected.Count -eq 0) { "No ExpectedServices setting" } else { "Not the named project ($named)" }
-    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "$why; services on: $onText." -Note "$why; on: $onText"
-    return $null
+  $expected = Resolve-ServiceNames $Project $Code 'ExpectedServices'
+  if ($null -eq $expected) { return }
+  $on = Get-ServicesOn $Project $Code
+  if ($null -eq $on) { return }
+  $onText = Format-ServicesOn $on
+  if ($named -and [string]$Project.name -ine $named) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "Not the named project ($named); services on: $onText." -Note "Not the named project ($named); $onText on"
+    return
   }
-  return @{ Expected = $expected; On = $on; OnText = $onText }
+  if ($expected.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No ExpectedServices setting; services on: $onText." -Note "No ExpectedServices setting; $onText on"
+    return
+  }
+  if ($Mode -eq 'Missing') {
+    $missing = @($expected | Where-Object { $on -notcontains $_ })
+    if ($missing.Count -eq 0) {
+      Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "Every expected service is on: $($expected -join ', ')." -Note ($expected -join ', ')
+      return
+    }
+    $items = @($missing | ForEach-Object { New-NamedItem 'Service' $_ 'In ExpectedServices but switched off' })
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusWarning `
+      -Description "Services on: $onText. Expected: $($expected -join ', '). Missing: $($missing -join ', ')." -Note "Missing: $($missing -join ', ')" -Items $items
+  } else {
+    $extra = @($on | Where-Object { $expected -notcontains $_ })
+    if ($extra.Count -eq 0) {
+      Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No unexpected services enabled; services on: $onText." -Note "No unexpected services enabled"
+      return
+    }
+    $items = @($extra | ForEach-Object { New-NamedItem 'Service' $_ 'Enabled but not in ExpectedServices' })
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusWarning `
+      -Description "Services on: $onText. Expected: $($expected -join ', '). Unexpected: $($extra -join ', ')." -Note "Unexpected: $($extra -join ', ')" -Items $items
+  }
 }
 
 function Rule_CFG100_ProjectHasExpectedServicesEnabled {
-  # Every service listed in ExpectedServices is switched on in Project settings, Overview.
-  # CFG110 is the other half: nothing outside the list is on.
+  # Standard model. Every service in ExpectedServices is switched on in Project settings,
+  # Overview. CFG110 is the other half: nothing outside the list is on.
   param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $ctx = Get-ExpectedServicesContext $Project $code
-  if (-not $ctx) { return }
-  $missing = @($ctx.Expected | Where-Object { $ctx.On -notcontains $_ })
-  if ($missing.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Every expected service is on: $($ctx.Expected -join ', ')." -Note "On: $($ctx.Expected -join ', ')"
-    return
-  }
-  $items = @($missing | ForEach-Object { New-NamedItem 'Service' $_ 'In ExpectedServices but switched off' })
-  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
-    -Description "Services on: $($ctx.OnText). Expected: $($ctx.Expected -join ', '). Missing: $($missing -join ', ')." -Note "Missing: $($missing -join ', ')" -Items $items
+  Test-StandardServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -Mode 'Missing'
 }
 
 function Rule_CFG110_ProjectDoesNotHaveUnexpectedServicesEnabled {
-  # No service outside ExpectedServices is switched on in Project settings, Overview.
-  # CFG100 is the other half: everything in the list is on.
+  # Standard model. No service outside ExpectedServices is switched on. CFG100 is the
+  # other half: everything in the list is on.
   param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $ctx = Get-ExpectedServicesContext $Project $code
-  if (-not $ctx) { return }
-  $extra = @($ctx.On | Where-Object { $ctx.Expected -notcontains $_ })
-  if ($extra.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Nothing on beyond ExpectedServices; services on: $($ctx.OnText)." -Note "No unexpected services on"
+  Test-StandardServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -Mode 'Extra'
+}
+
+function Test-NamedProjectsServicesRule {
+  # Shared by CFG120 to CFG132. HubSpoke model: every project named in ProjectSetting
+  # against the services in ServicesSetting. Runs once per run. Mode is Missing or Extra.
+  param($Project, [string]$Code, [string]$ProjectSetting, [string]$ServicesSetting, [string]$Mode, [string]$Plural)
+  if (-not (Test-ProjectModel $Project $Code 'HubSpoke')) { return }
+  if (-not (Test-FirstTarget $Project)) { return }
+  $names = @(Get-SettingList $ProjectSetting @())
+  if ($names.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusError -Description "No $ProjectSetting setting in the rules file; name the $Plural or switch $Code off." -Note "No $ProjectSetting setting"
     return
   }
-  $items = @($extra | ForEach-Object { New-NamedItem 'Service' $_ 'Enabled but not in ExpectedServices' })
-  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
-    -Description "Services on: $($ctx.OnText). Expected: $($ctx.Expected -join ', '). Unexpected: $($extra -join ', ')." -Note "Unexpected: $($extra -join ', ')" -Items $items
+  $expected = Resolve-ServiceNames $Project $Code $ServicesSetting
+  if ($null -eq $expected) { return }
+  $items = New-Object System.Collections.Generic.List[object]
+  $onTexts = @()
+  foreach ($name in $names) {
+    $p = Get-NamedProject $name
+    if (-not $p) { $items.Add((New-NamedItem 'Project' $name "Not found in the organization (check $ProjectSetting or PAT access)")); continue }
+    $on = Get-ServicesOn $Project $Code $p
+    if ($null -eq $on) { return }   # the red row is recorded
+    $onTexts += "$($p.name): $(Format-ServicesOn $on)"
+    if ($expected.Count -eq 0) { continue }
+    if ($Mode -eq 'Missing') {
+      foreach ($s in @($expected | Where-Object { $on -notcontains $_ })) { $items.Add((New-NamedItem 'Service' "$($p.name): $s" "In $ServicesSetting but switched off in $($p.name)")) }
+    } else {
+      foreach ($s in @($on | Where-Object { $expected -notcontains $_ })) { $items.Add((New-NamedItem 'Service' "$($p.name): $s" "Enabled in $($p.name) but not in $ServicesSetting")) }
+    }
+  }
+  $onSummary = $onTexts -join '; '
+  if ($expected.Count -eq 0 -and $items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No $ServicesSetting setting; services on: $onSummary." -Note "No $ServicesSetting setting; $onSummary"
+    return
+  }
+  if ($items.Count -eq 0) {
+    $note = if ($Mode -eq 'Missing') { "$($expected -join ', ') on in $(Format-Count $names.Count 'project')" } else { "No unexpected services enabled in $(Format-Count $names.Count 'project')" }
+    Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "$note; services on: $onSummary." -Note $note
+    return
+  }
+  $what = if ($Mode -eq 'Missing') { 'expected service is off' } else { 'unexpected service is on' }
+  $whats = if ($Mode -eq 'Missing') { 'expected services are off' } else { 'unexpected services are on' }
+  Add-Result -Project $Project -Rule $Code -Status $script:StatusWarning `
+    -Description ("{0} across the {1} ({2}). Services on: {3}." -f (Format-Count $items.Count $what $whats), $Plural, (($items | ForEach-Object { $_.Title }) -join ', '), $onSummary) `
+    -Note ("{0}: {1}" -f (Format-Count $items.Count $what $whats), (($items | ForEach-Object { $_.Title }) -join ', ')) -Items $items.ToArray()
+}
+
+function Rule_CFG120_HubProjectHasExpectedServicesEnabled {
+  # HubSpoke model. Every service in ExpectedHubServices is on in the HubProject.
+  param($Project)
+  Test-NamedProjectsServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'HubProject' -ServicesSetting 'ExpectedHubServices' -Mode 'Missing' -Plural 'hub project'
+}
+
+function Rule_CFG122_HubProjectDoesNotHaveUnexpectedServicesEnabled {
+  # HubSpoke model. Nothing outside ExpectedHubServices is on in the HubProject.
+  param($Project)
+  Test-NamedProjectsServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'HubProject' -ServicesSetting 'ExpectedHubServices' -Mode 'Extra' -Plural 'hub project'
+}
+
+function Rule_CFG130_SpokeProjectsHaveExpectedServicesEnabled {
+  # HubSpoke model. Every service in ExpectedSpokeServices is on in every SpokeProjects project.
+  param($Project)
+  Test-NamedProjectsServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'SpokeProjects' -ServicesSetting 'ExpectedSpokeServices' -Mode 'Missing' -Plural 'spoke projects'
+}
+
+function Rule_CFG132_SpokeProjectsDoNotHaveUnexpectedServicesEnabled {
+  # HubSpoke model. Nothing outside ExpectedSpokeServices is on in any SpokeProjects project.
+  param($Project)
+  Test-NamedProjectsServicesRule -Project $Project -Code (Get-RuleCode $MyInvocation.MyCommand.Name) -ProjectSetting 'SpokeProjects' -ServicesSetting 'ExpectedSpokeServices' -Mode 'Extra' -Plural 'spoke projects'
 }
 
 function Rule_CFG140_AreasDefined {
@@ -887,6 +1076,40 @@ function Rule_CFG155_IterationsFollowSafePiNaming {
     -Singular "iteration breaks the SAFe naming pattern" -Plural "iterations break the SAFe naming pattern"
 }
 
+function Rule_CFG157_SprintNamesFollowTheAgreedPattern {
+  # Every sprint name matches the SprintNamePattern setting, a regular expression such as
+  # ^Sprint (\d{3})$; the flat-list alternative to CFG155. When the pattern captures a
+  # number, the numbers must run without gaps.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $pattern = [string](Get-Setting 'SprintNamePattern' '')
+  if ([string]::IsNullOrWhiteSpace($pattern)) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No SprintNamePattern setting in the rules file; nothing to check." -Note "No SprintNamePattern setting"
+    return
+  }
+  $sprints = @(Get-DatedSprints $Project)
+  if ($sprints.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No dated sprints to check." -Note "No dated sprints to check"
+    return
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  $numbers = New-Object System.Collections.Generic.List[int]
+  foreach ($s in $sprints) {
+    $m = [regex]::Match([string]$s.Row.Node.name, $pattern)
+    if (-not $m.Success) { $items.Add((New-NodeItem $Project $s.Row 'Iteration' "Name does not match $pattern")); continue }
+    if ($m.Groups.Count -gt 1 -and $m.Groups[1].Value -match '^\d+$') { $numbers.Add([int]$m.Groups[1].Value) }
+  }
+  $gaps = @()
+  if ($numbers.Count -gt 1) {
+    $sorted = @($numbers | Sort-Object -Unique)
+    for ($n = $sorted[0]; $n -le $sorted[-1]; $n++) { if ($sorted -notcontains $n) { $gaps += $n } }
+    foreach ($g in $gaps) { $items.Add((New-NamedItem 'Iteration' "$g" "No sprint numbered $g between $($sorted[0]) and $($sorted[-1])")) }
+  }
+  $detail = if ($gaps.Count -gt 0) { "numbers skip $($gaps -join ', ')" } else { "" }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every sprint name matches the pattern ($($sprints.Count) checked)" `
+    -Singular "sprint name or number breaks the pattern" -Plural "sprint names or numbers break the pattern" -Detail $detail
+}
+
 function Rule_CFG160_IterationsHaveDates {
   # Every sprint (leaf iteration) has a start and a finish date.
   param($Project)
@@ -898,38 +1121,176 @@ function Rule_CFG160_IterationsHaveDates {
     -Singular "sprint has no dates" -Plural "sprints have no dates"
 }
 
+function ConvertTo-UtcDate([string]$Value) {
+  # Iteration dates arrive as ISO text with a Z. [datetime] would shift them to local time,
+  # which moves a midnight start to the previous evening and so to the wrong weekday.
+  return ([DateTimeOffset]$Value).UtcDateTime.Date
+}
+
+function Get-DatedSprints($Project) {
+  # Every sprint in the iteration tree: a leaf with both dates spanning SprintMaxDays or
+  # fewer. PI and release nodes are longer and so are left out. Shared by CFG157, CFG180 and CFG190.
+  $max = [int](Get-Setting 'SprintMaxDays' 21)
+  $leaves = @((Get-TreeNodes (Get-ClassificationTree $Project 'iteration')) | Where-Object { $_.IsLeaf -and $_.Node.attributes -and $_.Node.attributes.startDate -and $_.Node.attributes.finishDate })
+  return @($leaves | ForEach-Object {
+    $start = ConvertTo-UtcDate $_.Node.attributes.startDate
+    $end   = ConvertTo-UtcDate $_.Node.attributes.finishDate
+    [pscustomobject]@{ Row = $_; Start = $start; End = $end; Days = [int]($end - $start).TotalDays + 1 }
+  } | Where-Object { $_.Days -le $max })
+}
+
+function Get-Norm($Values) {
+  # The most common value in a list; ties go to the larger value so the answer is stable.
+  return ($Values | Group-Object | Sort-Object Count, Name -Descending | Select-Object -First 1).Name
+}
+
 function Rule_CFG180_ConsistentIterationLengths {
   # Every sprint (a dated leaf iteration of SprintMaxDays or fewer) is the same number of
-  # days. The most common length is the norm; sprints of any other length are flagged. PI
-  # nodes are longer than SprintMaxDays and so are left out.
+  # days. SprintLengthDays (setting) is the norm when given; otherwise the most common
+  # length is. Sprints of any other length are flagged. PI nodes are longer than
+  # SprintMaxDays and so are left out.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $leaves = @((Get-TreeNodes (Get-ClassificationTree $Project 'iteration')) | Where-Object { $_.IsLeaf -and $_.Node.attributes -and $_.Node.attributes.startDate -and $_.Node.attributes.finishDate })
-  if ($leaves.Count -eq 0) {
+  $dated = @(Get-DatedSprints $Project)
+  if ($dated.Count -eq 0) {
     Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No dated sprints to compare." -Note "No dated sprints to compare"
     return
   }
-  $max = [int](Get-Setting 'SprintMaxDays' 21)
-  $dated = @($leaves | ForEach-Object {
-    $days = [int](([datetime]$_.Node.attributes.finishDate).Date - ([datetime]$_.Node.attributes.startDate).Date).TotalDays + 1
-    [pscustomobject]@{ Row = $_; Days = $days }
-  } | Where-Object { $_.Days -le $max })
-  $norm = ($dated | Group-Object Days | Sort-Object Count, Name -Descending | Select-Object -First 1).Name
+  $agreed = Get-Setting 'SprintLengthDays' $null
+  $norm = if ($agreed) { [int]$agreed } else { Get-Norm ($dated | ForEach-Object { $_.Days }) }
+  $basis = if ($agreed) { "the agreed length" } else { "the most common length" }
   $odd = @($dated | Where-Object { [string]$_.Days -ne [string]$norm })
   if ($odd.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "All $($dated.Count) dated sprints are $norm days long." -Note "All sprints are $norm days"
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "All $($dated.Count) dated sprints are $norm days long, $basis." -Note "All sprints are $norm days"
     return
   }
   $items = @($odd | ForEach-Object { New-NodeItem $Project $_.Row 'Iteration' "$($_.Days) days, not $norm" })
   $lengths = (($odd | ForEach-Object { $_.Days } | Sort-Object -Unique) -join ', ')
   Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
-    -Description ("{0} of {1} dated sprints are not {2} days long ({3} days)." -f $odd.Count, $dated.Count, $norm, $lengths) `
+    -Description ("{0} of {1} dated sprints are not {2} days long, {3} ({4} days)." -f $odd.Count, $dated.Count, $norm, $basis, $lengths) `
     -Note ("{0} not {1} days ({2})" -f (Format-Count $odd.Count 'sprint is' 'sprints are'), $norm, $lengths) -Items $items
+}
+
+function Rule_CFG190_IterationsFollowTheSameCadence {
+  # Every sprint starts on the same weekday and finishes on the same weekday, so the
+  # calendar is one cadence: Wednesday to Tuesday, say, sprint after sprint. The most
+  # common start and finish weekdays are the norm; any sprint off either is flagged.
+  # CFG180 checks the length; together they say every sprint is the same shape.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $dated = @(Get-DatedSprints $Project)
+  if ($dated.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No dated sprints to compare." -Note "No dated sprints to compare"
+    return
+  }
+  $startNorm = Get-Norm ($dated | ForEach-Object { [string]$_.Start.DayOfWeek })
+  $endNorm   = Get-Norm ($dated | ForEach-Object { [string]$_.End.DayOfWeek })
+  $items = @(foreach ($s in $dated) {
+    $problems = @()
+    if ([string]$s.Start.DayOfWeek -ne $startNorm) { $problems += "Starts $($s.Start.DayOfWeek) $($s.Start.ToString('yyyy-MM-dd')), not $startNorm" }
+    if ([string]$s.End.DayOfWeek -ne $endNorm)     { $problems += "Ends $($s.End.DayOfWeek) $($s.End.ToString('yyyy-MM-dd')), not $endNorm" }
+    if ($problems.Count -gt 0) { New-NodeItem $Project $s.Row 'Iteration' ($problems -join '; ') }
+  })
+  $cadence = "$startNorm to $endNorm"
+  if ($items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "All $($dated.Count) dated sprints run $cadence." -Note "All sprints run $cadence"
+    return
+  }
+  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
+    -Description ("{0} of {1} dated sprints do not run {2}." -f $items.Count, $dated.Count, $cadence) `
+    -Note ("{0} off the {1} cadence" -f (Format-Count $items.Count 'sprint is' 'sprints are'), $cadence) -Items $items
+}
+
+
+# ---- Teams
+function Get-AdoTeams($Project) {
+  # The project's teams, cached per project.
+  if (-not $script:TeamCache) { $script:TeamCache = @{} }
+  $key = [string]$Project.id
+  if (-not $script:TeamCache.ContainsKey($key)) {
+    $rows = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/projects/$($Project.id)/teams?`$top=500&api-version=$($script:ApiVersion)") -AllPages
+    $script:TeamCache[$key] = @($rows)
+  }
+  # Assign the result, as with Get-AnalyticsWorkItems; @(Get-AdoTeams ...) would nest the array.
+  return ,$script:TeamCache[$key]
+}
+
+function Get-AdoTeamMembers($Project, $Team) {
+  # Assign the result; @(Get-AdoTeamMembers ...) would nest the array.
+  $rows = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/projects/$($Project.id)/teams/$($Team.id)/members?`$top=500&api-version=$($script:ApiVersion)") -AllPages
+  return ,@($rows)
+}
+
+function Get-TeamNameSets($Project) {
+  # The project's team names and the ExpectedTeams setting, compared case-insensitively.
+  $teams = Get-AdoTeams $Project
+  $names = @($teams | ForEach-Object { [string]$_.name } | Sort-Object)
+  $expected = @(Get-SettingList 'ExpectedTeams' @())
+  return @{
+    Names    = $names
+    Expected = $expected
+    Missing  = @($expected | Where-Object { $e = $_; -not ($names | Where-Object { $_ -ieq $e }) })
+    Extra    = @($names | Where-Object { $n = $_; -not ($expected | Where-Object { $_ -ieq $n }) })
+  }
+}
+
+function Rule_CFG305_ExpectedTeamsArePresent {
+  # Every team in the ExpectedTeams setting exists in the project. CFG307 is the other
+  # half: nothing outside the list exists.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $sets = Get-TeamNameSets $Project
+  if ($sets.Expected.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
+      -Description "No ExpectedTeams setting; $(Format-Count $sets.Names.Count 'team'): $($sets.Names -join ', ')." -Note "No ExpectedTeams setting; $(Format-Count $sets.Names.Count 'team')"
+    return
+  }
+  $items = @($sets.Missing | ForEach-Object { New-NamedItem 'Team' $_ 'In ExpectedTeams but not in the project' })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every expected team is present ($($sets.Expected.Count) checked)" `
+    -Singular "expected team is missing" -Plural "expected teams are missing" -Detail ($sets.Missing -join ', ')
+}
+
+function Rule_CFG307_NoUnexpectedTeamsPresent {
+  # No team exists outside the ExpectedTeams setting; sub-groups that only need a filter
+  # are area paths, not teams. CFG305 is the other half.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $sets = Get-TeamNameSets $Project
+  if ($sets.Expected.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
+      -Description "No ExpectedTeams setting; $(Format-Count $sets.Names.Count 'team'): $($sets.Names -join ', ')." -Note "No ExpectedTeams setting; $(Format-Count $sets.Names.Count 'team')"
+    return
+  }
+  $items = @($sets.Extra | ForEach-Object { New-NamedItem 'Team' $_ 'In the project but not in ExpectedTeams' })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No unexpected teams ($($sets.Names.Count) present)" `
+    -Singular "unexpected team is present" -Plural "unexpected teams are present" -Detail ($sets.Extra -join ', ')
+}
+
+function Rule_CFG315_TeamsAreNotOversized {
+  # No team has more than TeamMaxMembers (setting, 10); a team of 15 is two teams.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [int](Get-Setting 'TeamMaxMembers' 10)
+  $teams = Get-AdoTeams $Project
+  $sizes = @(foreach ($team in $teams) {
+    $members = Get-AdoTeamMembers $Project $team
+    [pscustomobject]@{ Team = [string]$team.name; Count = @($members).Count }
+  })
+  $sizes = @($sizes | Sort-Object Count -Descending)
+  if ($sizes.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No teams in the project." -Note "No teams"
+    return
+  }
+  $items = @($sizes | Where-Object { $_.Count -gt $max } | ForEach-Object { New-NamedItem 'Team' $_.Team "$($_.Count) members, limit $max" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items `
+    -PassNote "No team has more than $max members (largest: $($sizes[0].Team) with $($sizes[0].Count))" `
+    -Singular "team has more than $max members" -Plural "teams have more than $max members" `
+    -Detail (($sizes | ForEach-Object { "$($_.Team): $($_.Count)" }) -join ', ')
 }
 
 
 #######################################################################################################################################################################
-#                                                                          RULES: WRK (work items)                                                                    #
+#                                                        RULES: WRK 1xx to 5xx (Epics, Features, Stories, Bugs, Tasks)                                                  #
 #######################################################################################################################################################################
 
 function New-TypeFilter([string[]]$Types) {
@@ -939,11 +1300,19 @@ function New-TypeFilter([string[]]$Types) {
 
 function Get-OpenFilter {
   # OData filter fragment excluding the IgnoreStateCategories setting (default Completed, Removed).
+  # Analytics gives items in a Removed state a null StateCategory, and its "ne" follows SQL
+  # rules, so "StateCategory ne 'Removed'" drops them too. Get-RemovedFilter is the positive
+  # form; "StateCategory eq 'Removed'" alone matches nothing.
   $f = ""
   foreach ($category in (Get-SettingList 'IgnoreStateCategories' @('Completed', 'Removed'))) {
     $f += " and StateCategory ne '$(ConvertTo-ODataString $category)'"
   }
   return $f
+}
+
+function Get-RemovedFilter {
+  # OData filter fragment matching items in a Removed state (see Get-OpenFilter for why null).
+  return "(StateCategory eq 'Removed' or StateCategory eq null)"
 }
 
 # The work item types the hierarchy rules look at, top to bottom.
@@ -1056,81 +1425,8 @@ function Test-ParentRule {
   Add-Result -Project $Project -Rule $RuleCode -Status $script:StatusWarning -Description $description -Note $note -Items ($items | Sort-Object Problem, Id)
 }
 
-function Rule_WRK100_NoSameTypeParentLinks {
-  # No parent-child link between two items of the same type: no Feature under a
-  # Feature, no Epic under an Epic, no Task under a Task.
-  param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $filter = (New-TypeFilter $script:HierarchyTypes) + (Get-OpenFilter) + " and ParentWorkItemId ne null"
-  $children = Get-AnalyticsWorkItems -Project $Project -Filter $filter `
-    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
-  if ($children.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
-      -Description "No same-type links; no open items have a parent in this project." -Note "No same-type links (no parent links open)"
-    return
-  }
-  $parents = Get-WorkItemFields -Ids @($children | ForEach-Object { [int]$_.ParentWorkItemId })
-  $items = New-Object System.Collections.Generic.List[object]
-  foreach ($c in $children) {
-    $parentKey = [int]$c.ParentWorkItemId
-    if (-not $parents.ContainsKey($parentKey)) { continue }
-    $ptype = [string]$parents[$parentKey].'System.WorkItemType'
-    if ($ptype -eq [string]$c.WorkItemType) {
-      $items.Add([pscustomobject]@{
-        Id = [int]$c.WorkItemId; Type = [string]$c.WorkItemType; Title = [string]$c.Title; State = [string]$c.State
-        AreaPath = if ($c.Area) { [string]$c.Area.AreaPath } else { "" }
-        Problem = "$ptype under $ptype"; ParentId = $parentKey; ParentType = $ptype; Url = Get-WorkItemUrl $Project $c.WorkItemId
-      })
-    }
-  }
-  $links = Format-Count $children.Count "parent link"
-  if ($items.Count -eq 0) {
-    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
-      -Description "No same-type links; $links checked." -Note "No same-type links ($links checked)"
-    return
-  }
-  $byType = $items | Group-Object Type | Sort-Object Name | ForEach-Object { "$($_.Name) under $($_.Name): $($_.Count)" }
-  $found = if ($items.Count -eq 1) { "Same-type link found" } else { "Same-type links found" }
-  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
-    -Description ("{0}: {1} of {2} ({3})." -f $found, $items.Count, $links, ($byType -join ', ')) `
-    -Note ((Format-Count $items.Count "parent link joins" "parent links join") + " two items of the same type") -Items ($items | Sort-Object Type, Id)
-}
-
-function Rule_WRK110_FeaturesHaveParentEpic {
-  # Every open Feature has a parent, and that parent is an Epic (D4).
-  param($Project)
-  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
-    -ChildTypes 'Feature' -Singular 'Feature' -Plural 'Features' `
-    -ParentTypes 'Epic' -ParentLabel 'Epic'
-}
-
-function Rule_WRK200_StoriesHaveParentFeature {
-  # Every open User Story (or Product Backlog Item, once the hub is on Scrum) has a
-  # parent, and that parent is a Feature (D4).
-  param($Project)
-  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
-    -ChildTypes 'User Story', 'Product Backlog Item' -Singular 'User Story' -Plural 'User Stories' `
-    -ParentTypes 'Feature' -ParentLabel 'Feature'
-}
-
-function Rule_WRK210_BugsHaveParent {
-  # Every open Bug has a parent, and that parent is a Feature or a User Story (D16).
-  param($Project)
-  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
-    -ChildTypes 'Bug' -Singular 'Bug' -Plural 'Bugs' `
-    -ParentTypes 'Feature', 'User Story', 'Product Backlog Item' -ParentLabel 'Feature or User Story'
-}
-
-function Rule_WRK220_TasksHaveParentStoryOrBug {
-  # Every open Task has a parent, and that parent is a User Story, Product Backlog Item
-  # or Bug. Tasks are optional, but never orphans (D23).
-  param($Project)
-  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
-    -ChildTypes 'Task' -Singular 'Task' -Plural 'Tasks' `
-    -ParentTypes 'User Story', 'Product Backlog Item', 'Bug' -ParentLabel 'User Story or Bug'
-}
-
-function Rule_WRK120_EpicsHaveNoParentOrInitiative {
+# ---- Parent rules, one per type
+function Rule_WRK100_EpicsHaveNoParentOrInitiative {
   # Nothing sits above Epic (D3). An Epic may have no parent, or an Initiative while that
   # type still exists; any other parent is flagged.
   param($Project)
@@ -1139,7 +1435,49 @@ function Rule_WRK120_EpicsHaveNoParentOrInitiative {
     -ParentTypes 'Initiative' -ParentLabel 'Initiative' -AllowNoParent
 }
 
+function Rule_WRK200_FeaturesHaveParentEpic {
+  # Every open Feature has a parent, and that parent is an Epic (D4).
+  param($Project)
+  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
+    -ChildTypes 'Feature' -Singular 'Feature' -Plural 'Features' `
+    -ParentTypes 'Epic' -ParentLabel 'Epic'
+}
+
+function Rule_WRK300_StoriesHaveParentFeature {
+  # Every open User Story (or Product Backlog Item, once the hub is on Scrum) has a
+  # parent, and that parent is a Feature (D4).
+  param($Project)
+  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
+    -ChildTypes 'User Story', 'Product Backlog Item' -Singular 'User Story' -Plural 'User Stories' `
+    -ParentTypes 'Feature' -ParentLabel 'Feature'
+}
+
+function Rule_WRK400_BugsHaveParent {
+  # Every open Bug has a parent, and that parent is a Feature or a User Story (D16).
+  param($Project)
+  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
+    -ChildTypes 'Bug' -Singular 'Bug' -Plural 'Bugs' `
+    -ParentTypes 'Feature', 'User Story', 'Product Backlog Item' -ParentLabel 'Feature or User Story'
+}
+
+function Rule_WRK500_TasksHaveParentStoryOrBug {
+  # Every open Task has a parent, and that parent is a User Story, Product Backlog Item
+  # or Bug. Tasks are optional, but never orphans (D23).
+  param($Project)
+  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
+    -ChildTypes 'Task' -Singular 'Task' -Plural 'Tasks' `
+    -ParentTypes 'User Story', 'Product Backlog Item', 'Bug' -ParentLabel 'User Story or Bug'
+}
+
 $script:StoryTypes = @('User Story', 'Product Backlog Item')
+
+function Get-RequirementTypes {
+  # Stories, plus Bugs when the BugsAreRequirements setting (default true) says the teams
+  # manage Bugs on the backlog alongside Stories; Bugs managed as Tasks are left out of the
+  # sprint-item rules.
+  if ([bool](Get-Setting 'BugsAreRequirements' $true)) { return $script:StoryTypes + @('Bug') }
+  return $script:StoryTypes
+}
 
 function Get-ParentChildPairs {
   # Every item in the hierarchy that has a parent (any state but Removed), plus a
@@ -1262,24 +1600,224 @@ function Test-ActiveChildRule {
     -Note ("{0} {1} active children" -f $items.Count, $label) -Items ($items | Sort-Object Id)
 }
 
-# ---- Closed parents with open children
-function Rule_WRK300_ClosedEpicsHaveNoOpenChildren    { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentPlural 'Epics' -ChildPlural 'Features' }
-function Rule_WRK310_ClosedFeaturesHaveNoOpenChildren { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentPlural 'Features' -ChildPlural 'User Stories' }
-function Rule_WRK320_ClosedStoriesHaveNoOpenChildren  { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentPlural 'User Stories' -ChildPlural 'Tasks' }
+# ---- Epics (WRK1xx): WRK100 is above; these read the cached parent-child pairs
+function Rule_WRK110_ClosedEpicsHaveNoOpenChildren      { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentPlural 'Epics' -ChildPlural 'Features' }
+function Rule_WRK120_EpicsWithAllChildrenClosedAreClosed { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentSingular 'Epic' -ParentPlural 'Epics' }
+function Rule_WRK130_EpicsWithActiveChildAreActive      { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentSingular 'Epic' -ParentPlural 'Epics' }
 
-# ---- Parents with every child Closed should be Closed
-function Rule_WRK400_EpicsWithAllChildrenClosedAreClosed    { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentSingular 'Epic' -ParentPlural 'Epics' }
-function Rule_WRK410_FeaturesWithAllChildrenClosedAreClosed { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentSingular 'Feature' -ParentPlural 'Features' }
-function Rule_WRK420_StoriesWithAllChildrenClosedAreClosed  { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentSingular 'User Story' -ParentPlural 'User Stories' }
+# ---- Features (WRK2xx): WRK200 is above
+function Rule_WRK210_ClosedFeaturesHaveNoOpenChildren      { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentPlural 'Features' -ChildPlural 'User Stories' }
+function Rule_WRK220_FeaturesWithAllChildrenClosedAreClosed { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentSingular 'Feature' -ParentPlural 'Features' }
+function Rule_WRK230_FeaturesWithActiveChildAreActive      { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentSingular 'Feature' -ParentPlural 'Features' }
 
-# ---- Parents with an active child should be active
-function Rule_WRK500_EpicsWithActiveChildAreActive    { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentSingular 'Epic' -ParentPlural 'Epics' }
-function Rule_WRK510_FeaturesWithActiveChildAreActive { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentSingular 'Feature' -ParentPlural 'Features' }
-function Rule_WRK520_StoriesWithActiveChildAreActive  { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentSingular 'User Story' -ParentPlural 'User Stories' }
+# ---- Stories (WRK3xx): WRK300 is above
+function Rule_WRK310_ClosedStoriesHaveNoOpenChildren      { param($Project); Test-ClosedParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentPlural 'User Stories' -ChildPlural 'Tasks' }
+function Rule_WRK320_StoriesWithAllChildrenClosedAreClosed { param($Project); Test-AllChildrenClosedRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentSingular 'User Story' -ParentPlural 'User Stories' }
+function Rule_WRK330_StoriesWithActiveChildAreActive      { param($Project); Test-ActiveChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentSingular 'User Story' -ParentPlural 'User Stories' }
+
+
+# ---- Text fields (WRK160, WRK270, WRK360)
+function Test-TextFieldsRule {
+  # Every item in Rows has text in each of the fields named (reference name -> label), where
+  # the field exists on the item's type. HTML fields are not in Analytics, so they are read
+  # through the work items REST API, 200 items per call.
+  param($Project, [string]$RuleCode, $Rows, $Fields, [string]$PassNote, [string]$Singular, [string]$Plural)
+  $rows = @($Rows)
+  if ($rows.Count -eq 0) {
+    Add-Result -Project $Project -Rule $RuleCode -Status $script:StatusPass -Description "$PassNote; nothing to check." -Note "$PassNote (nothing to check)"
+    return
+  }
+  $types = @($rows | ForEach-Object { [string]$_.WorkItemType } | Select-Object -Unique)
+  $onType = @{}
+  foreach ($ty in $types) { $onType[$ty] = @(Get-WorkItemTypeFieldNames $Project $ty) }
+  # Ask only for fields some type in play actually has; a field unknown to the project is a 400.
+  $request = @($Fields.Keys | Where-Object { $ref = $_; @($types | Where-Object { $onType[$_] -contains $ref }).Count -gt 0 })
+  if ($request.Count -eq 0) { $request = @($Fields.Keys) }
+  $values = Get-WorkItemFields -Ids @($rows | ForEach-Object { [int]$_.WorkItemId }) -Fields $request
+  $items = @(foreach ($w in $rows) {
+    $have = $onType[[string]$w.WorkItemType]
+    $f = $values[[int]$w.WorkItemId]
+    $missing = @(foreach ($ref in $Fields.Keys) {
+      if ($have.Count -gt 0 -and $have -notcontains $ref) { continue }
+      $text = if ($f) { [string]$f.$ref } else { "" }
+      if (-not (Test-HasText $text)) { $Fields[$ref] }
+    })
+    if ($missing.Count -gt 0) { New-WorkItemRow $Project $w ("No " + ($missing -join ' or ')) }
+  })
+  Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "$PassNote ($($rows.Count) checked)" `
+    -Singular $Singular -Plural $Plural -Detail (Get-TypeCounts $items)
+}
+
+# ---- Epics (WRK1xx), continued
+function Rule_WRK160_EpicsHaveADescriptionAndAcceptanceCriteria {
+  # Every open Epic carries a value statement in the description and acceptance criteria that
+  # say how the Epic is known to be done. The criteria are required only where the type has
+  # the field.
+  param($Project)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  Test-TextFieldsRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows $rows `
+    -Fields ([ordered]@{ 'System.Description' = 'description'; 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }) `
+    -PassNote "Every open Epic has a description and acceptance criteria" `
+    -Singular "open Epic lacks a description or acceptance criteria" -Plural "open Epics lack a description or acceptance criteria"
+}
+
+# ---- Features (WRK2xx), continued
+function Rule_WRK270_FeaturesHaveADescription {
+  # Every open Feature has a description; a Feature is how the business reads what IT is doing.
+  param($Project)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Feature') + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  Test-TextFieldsRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows $rows `
+    -Fields ([ordered]@{ 'System.Description' = 'description' }) `
+    -PassNote "Every open Feature has a description" `
+    -Singular "open Feature has no description" -Plural "open Features have no description"
+}
+
+# ---- Stories (WRK3xx), continued
+function Rule_WRK360_SprintStoriesHaveADescriptionAndAcceptanceCriteria {
+  # Every Story or Bug in a sprint that has not ended has a description and acceptance
+  # criteria: a shell story is a reminder, not a commitment, and the criteria are the
+  # Definition of Ready and the source of the test cases.
+  param($Project)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $inSprint = @($rows | Where-Object { (Get-SprintPhase $_.Iteration) -in 'current', 'future' })
+  Test-TextFieldsRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows $inSprint `
+    -Fields ([ordered]@{ 'System.Description' = 'description'; 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }) `
+    -PassNote "Every sprint Story has a description and acceptance criteria" `
+    -Singular "sprint Story lacks a description or acceptance criteria" -Plural "sprint Stories lack a description or acceptance criteria"
+}
+
+function Rule_WRK370_SprintStoriesAreNotOversized {
+  # No Story or Bug in a sprint carries an estimate above SprintMaxEstimate (setting, 8);
+  # a 13 is a Feature. The field name comes from the EstimateField setting.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [int](Get-Setting 'SprintMaxEstimate' 8)
+  $field = [string](Get-Setting 'EstimateField' 'StoryPoints')
+  $rows = Get-AnalyticsWorkItems -Project $Project `
+    -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter) + " and $field gt $max") `
+    -Select "WorkItemId,Title,WorkItemType,State,$field" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $items = @($rows | Where-Object { Test-IsSprint $_.Iteration } |
+    ForEach-Object { New-WorkItemRow $Project $_ "$field $($_.$field) in $($_.Iteration.IterationPath), limit $max" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No sprint item is larger than $max" `
+    -Singular "sprint item is larger than $max" -Plural "sprint items are larger than $max" -Detail (Get-TypeCounts $items)
+}
+
+# ---- Tasks (WRK5xx), continued
+function Rule_WRK510_TasksShareTheAreaPathOfTheirParent {
+  # Every open Task has the same Area Path as its parent; otherwise it drops off the
+  # taskboard and the burndown.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $tasks = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + (Get-OpenFilter) + " and ParentWorkItemId ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  if ($tasks.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No open Tasks with a parent." -Note "No open Tasks with a parent"
+    return
+  }
+  $parents = Get-WorkItemFields -Ids @($tasks | ForEach-Object { [int]$_.ParentWorkItemId }) -Fields @('System.WorkItemType', 'System.AreaPath')
+  $items = @(foreach ($w in $tasks) {
+    $parentId = [int]$w.ParentWorkItemId
+    if (-not $parents.ContainsKey($parentId)) { continue }
+    $parea = [string]$parents[$parentId].'System.AreaPath'
+    $area  = if ($w.Area) { [string]$w.Area.AreaPath } else { "" }
+    if ($area -ine $parea) {
+      $row = New-WorkItemRow $Project $w "In $area; parent $($parents[$parentId].'System.WorkItemType') $parentId is in $parea"
+      $row.ParentId = $parentId; $row.ParentType = [string]$parents[$parentId].'System.WorkItemType'
+      $row
+    }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Task shares its parent's area ($($tasks.Count) checked)" `
+    -Singular "Task is in a different area than its parent" -Plural "Tasks are in a different area than their parent"
+}
+
+function Rule_WRK520_TasksAreNotCreatedAheadOfTheSprint {
+  # No open Task sits under a Story or Bug that is in the backlog or in a sprint that has
+  # not started; tasking happens in Sprint Planning, not weeks before. Tasks without a
+  # parent are WRK500's business.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $parents = @{}
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter)) `
+    -Select "WorkItemId,WorkItemType,State" -Expand "Iteration(`$select=IterationPath,StartDate,EndDate)"
+  foreach ($r in $rows) { $parents[[int]$r.WorkItemId] = $r }
+  $tasks = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + (Get-OpenFilter) + " and ParentWorkItemId ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  $items = @(foreach ($w in $tasks) {
+    $p = $parents[[int]$w.ParentWorkItemId]
+    if ($null -eq $p) { continue }
+    $phase = Get-SprintPhase $p.Iteration
+    if ($phase -eq 'current' -or $phase -eq 'past') { continue }
+    $path = if ($p.Iteration) { [string]$p.Iteration.IterationPath } else { "" }
+    $problem = if ($phase -eq 'future') { "Parent $($p.WorkItemType) $($p.WorkItemId) is in $path, which starts $((ConvertTo-UtcDate ([string]$p.Iteration.StartDate)).ToString('yyyy-MM-dd'))" }
+               else { "Parent $($p.WorkItemType) $($p.WorkItemId) is not in a sprint ($path)" }
+    $row = New-WorkItemRow $Project $w $problem
+    $row.ParentId = [int]$p.WorkItemId; $row.ParentType = [string]$p.WorkItemType
+    $row
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Tasks under Stories outside a started sprint" `
+    -Singular "Task sits under a Story that is not in a started sprint" -Plural "Tasks sit under Stories that are not in a started sprint"
+}
+
+function Rule_WRK530_SprintTasksHaveRemainingWork {
+  # Every open Task in the current sprint has Remaining Work set, or the burndown is flat by
+  # construction.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + (Get-OpenFilter) + " and RemainingWork eq null") `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $items = @($rows | Where-Object { (Get-SprintPhase $_.Iteration) -eq 'current' } |
+    ForEach-Object { New-WorkItemRow $Project $_ "No Remaining Work in $($_.Iteration.IterationPath)" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Task in the current sprint has Remaining Work" `
+    -Singular "current-sprint Task has no Remaining Work" -Plural "current-sprint Tasks have no Remaining Work"
+}
+
+# ---- Testing (WRK6xx)
+function Rule_WRK600_SprintStoriesHaveALinkedTestCase {
+  # Every Story or Bug in the current sprint has at least one Tested By link, one test per
+  # acceptance criterion. Links come from the work items REST API.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $inSprint = @($rows | Where-Object { (Get-SprintPhase $_.Iteration) -eq 'current' })
+  if ($inSprint.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No Stories in the current sprint; nothing to check." -Note "No Stories in the current sprint"
+    return
+  }
+  $relations = Get-WorkItemRelations -Ids @($inSprint | ForEach-Object { [int]$_.WorkItemId })
+  $items = @($inSprint | Where-Object {
+      $rel = $relations[[int]$_.WorkItemId]
+      @($rel | Where-Object { $_.rel -eq 'Microsoft.VSTS.Common.TestedBy-Forward' }).Count -eq 0
+    } | ForEach-Object { New-WorkItemRow $Project $_ "No Tested By link in $($_.Iteration.IterationPath)" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Story in the current sprint has a linked test case ($($inSprint.Count) checked)" `
+    -Singular "sprint Story has no linked test case" -Plural "sprint Stories have no linked test case" -Detail (Get-TypeCounts $items)
+}
 
 
 #######################################################################################################################################################################
-#                                                              RULES: WRK 600 to 900 (placement, state, fields, staleness)                                          #
+#                                                   RULES: WRK 7xx to 9xx (generic: placement, state, fields, flow and staleness)                                    #
+function Rule_WRK980_CycleTimeStaysWithinTheSprintLength {
+  # Stories and Bugs completed in the last CycleWindowDays (setting, 90) while in a sprint
+  # have a Cycle Time no longer than that sprint; longer means the board was moved at Sprint
+  # Review, not when the work finished. Items that never went In Progress have no cycle time
+  # and are skipped.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $days = [int](Get-Setting 'CycleWindowDays' 90)
+  $rows = Get-AnalyticsWorkItems -Project $Project `
+    -Filter ((New-TypeFilter (Get-RequirementTypes)) + " and StateCategory eq 'Completed' and CompletedDate ge $(Get-UtcCutoff $days) and CycleTimeDays ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,CycleTimeDays" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $inSprint = @($rows | Where-Object { Test-IsSprint $_.Iteration })
+  $items = @($inSprint | Where-Object { [double]$_.CycleTimeDays -gt (Get-SprintDays $_.Iteration) } | ForEach-Object {
+    New-WorkItemRow $Project $_ ("Cycle time {0} days in a {1}-day sprint ({2})" -f [math]::Round([double]$_.CycleTimeDays), (Get-SprintDays $_.Iteration), $_.Iteration.IterationPath)
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every sprint item closed in the last $days days had a cycle time within its sprint ($($inSprint.Count) checked)" `
+    -Singular "item closed in the last $days days had a cycle time longer than its sprint" -Plural "items closed in the last $days days had a cycle time longer than their sprint" -Detail (Get-TypeCounts $items)
+}
+
 #######################################################################################################################################################################
 
 function New-WorkItemRow($Project, $W, [string]$Problem) {
@@ -1296,6 +1834,21 @@ function Test-IsSprint($Iteration) {
   if (-not $Iteration -or -not $Iteration.StartDate -or -not $Iteration.EndDate) { return $false }
   $days = ([datetime]$Iteration.EndDate).Date.Subtract(([datetime]$Iteration.StartDate).Date).TotalDays + 1
   return ($days -le [int](Get-Setting 'SprintMaxDays' 21))
+}
+
+function Get-SprintPhase($Iteration) {
+  # 'past', 'current' or 'future' for a sprint (see Test-IsSprint); $null for anything else.
+  if (-not (Test-IsSprint $Iteration)) { return $null }
+  $today = (Get-Date).ToUniversalTime().Date
+  $start = ConvertTo-UtcDate ([string]$Iteration.StartDate)
+  $end   = ConvertTo-UtcDate ([string]$Iteration.EndDate)
+  if ($end -lt $today) { return 'past' }
+  if ($start -gt $today) { return 'future' }
+  return 'current'
+}
+
+function Get-SprintDays($Iteration) {
+  return [int]((ConvertTo-UtcDate ([string]$Iteration.EndDate)) - (ConvertTo-UtcDate ([string]$Iteration.StartDate))).TotalDays + 1
 }
 
 function Get-UtcCutoff([int]$DaysAgo) {
@@ -1319,8 +1872,72 @@ function Get-TypeCounts($Items) {
   return (@($Items) | Group-Object Type | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
 }
 
-# ---- Placement
-function Rule_WRK600_EpicsAndFeaturesAreNotInASprint {
+# ---- Hierarchy and placement (WRK7xx)
+function Rule_WRK700_NoSameTypeParentLinks {
+  # No parent-child link between two items of the same type: no Feature under a
+  # Feature, no Epic under an Epic, no Task under a Task.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $filter = (New-TypeFilter $script:HierarchyTypes) + (Get-OpenFilter) + " and ParentWorkItemId ne null"
+  $children = Get-AnalyticsWorkItems -Project $Project -Filter $filter `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  if ($children.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
+      -Description "No same-type links; no open items have a parent in this project." -Note "No same-type links (no parent links open)"
+    return
+  }
+  $parents = Get-WorkItemFields -Ids @($children | ForEach-Object { [int]$_.ParentWorkItemId })
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($c in $children) {
+    $parentKey = [int]$c.ParentWorkItemId
+    if (-not $parents.ContainsKey($parentKey)) { continue }
+    $ptype = [string]$parents[$parentKey].'System.WorkItemType'
+    if ($ptype -eq [string]$c.WorkItemType) {
+      $items.Add([pscustomobject]@{
+        Id = [int]$c.WorkItemId; Type = [string]$c.WorkItemType; Title = [string]$c.Title; State = [string]$c.State
+        AreaPath = if ($c.Area) { [string]$c.Area.AreaPath } else { "" }
+        Problem = "$ptype under $ptype"; ParentId = $parentKey; ParentType = $ptype; Url = Get-WorkItemUrl $Project $c.WorkItemId
+      })
+    }
+  }
+  $links = Format-Count $children.Count "parent link"
+  if ($items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
+      -Description "No same-type links; $links checked." -Note "No same-type links ($links checked)"
+    return
+  }
+  $byType = $items | Group-Object Type | Sort-Object Name | ForEach-Object { "$($_.Name) under $($_.Name): $($_.Count)" }
+  $found = if ($items.Count -eq 1) { "Same-type link found" } else { "Same-type links found" }
+  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning `
+    -Description ("{0}: {1} of {2} ({3})." -f $found, $items.Count, $links, ($byType -join ', ')) `
+    -Note ((Format-Count $items.Count "parent link joins" "parent links join") + " two items of the same type") -Items ($items | Sort-Object Type, Id)
+}
+
+function Rule_WRK715_RemovedParentsHaveNoOpenChildren {
+  # No open item sits under a Removed Epic, Feature, Story or Bug; Removed does not cascade,
+  # so archiving a parent strands its children.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $removed = @{}
+  $parentTypes = @('Epic', 'Feature') + $script:StoryTypes + @('Bug')
+  foreach ($r in (Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $parentTypes) + " and " + (Get-RemovedFilter)) -Select "WorkItemId,Title,WorkItemType,State")) {
+    $removed[[int]$r.WorkItemId] = $r
+  }
+  if ($removed.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No Removed parents in this project." -Note "No Removed parents"
+    return
+  }
+  $children = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:HierarchyTypes) + (Get-OpenFilter) + " and ParentWorkItemId ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  $items = @(foreach ($c in $children) {
+    $p = $removed[[int]$c.ParentWorkItemId]
+    if ($p) { New-ChildItem $Project $c $p "Parent $($p.WorkItemType) $($p.WorkItemId) is $($p.State)" }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open items under Removed parents" `
+    -Singular "open item sits under a Removed parent" -Plural "open items sit under Removed parents" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK720_EpicsAndFeaturesAreNotInASprint {
   # Epics and Features live at the root or PI level of the iteration tree, never in a
   # sprint (an iteration of SprintMaxDays or fewer).
   param($Project)
@@ -1333,7 +1950,7 @@ function Rule_WRK600_EpicsAndFeaturesAreNotInASprint {
     -Singular "Epic or Feature sits in a sprint" -Plural "Epics and Features sit in a sprint" -Detail (Get-TypeCounts $items)
 }
 
-function Rule_WRK610_OpenItemsAreNotInAPastIteration {
+function Rule_WRK730_OpenItemsAreNotInAPastIteration {
   # Nothing open is left in an iteration that has already ended.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
@@ -1345,7 +1962,7 @@ function Rule_WRK610_OpenItemsAreNotInAPastIteration {
     -Singular "open item sits in a past iteration" -Plural "open items sit in a past iteration" -Detail (Get-TypeCounts $items)
 }
 
-function Rule_WRK620_ExecutionItemsAreNotInTheRootArea {
+function Rule_WRK740_ExecutionItemsAreNotInTheRootArea {
   # Stories, Bugs and Tasks belong to a team area, never the project root.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
@@ -1358,8 +1975,30 @@ function Rule_WRK620_ExecutionItemsAreNotInTheRootArea {
     -Singular "open item sits in the root area" -Plural "open items sit in the root area" -Detail (Get-TypeCounts $items)
 }
 
-# ---- State hygiene
-function Rule_WRK700_ItemsAreNotClosedInBatches {
+function Rule_WRK785_ItemsAreNotPlannedTooFarAhead {
+  # No open Story, Bug or Task sits in a sprint that starts more than PlanAheadSprints
+  # (setting, 1) sprints from today; pre-bucketing is a plan nobody made. The sprint length
+  # is the most common one in the tree, SprintMaxDays when there are no dated sprints.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $ahead = [int](Get-Setting 'PlanAheadSprints' 1)
+  $sprints = @(Get-DatedSprints $Project)
+  $length = if ($sprints.Count -gt 0) { [int](Get-Norm ($sprints | ForEach-Object { $_.Days })) } else { [int](Get-Setting 'SprintMaxDays' 21) }
+  $today = (Get-Date).ToUniversalTime().Date
+  $horizon = $today.AddDays($ahead * $length)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter ($script:StoryTypes + @('Bug', 'Task'))) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $items = @($rows | Where-Object { (Test-IsSprint $_.Iteration) -and (ConvertTo-UtcDate ([string]$_.Iteration.StartDate)) -gt $horizon } | ForEach-Object {
+    $start = ConvertTo-UtcDate ([string]$_.Iteration.StartDate)
+    New-WorkItemRow $Project $_ ("In {0} starting {1}, {2} days out" -f $_.Iteration.IterationPath, $start.ToString('yyyy-MM-dd'), [int]($start - $today).TotalDays)
+  })
+  $window = Format-Count $ahead 'sprint'
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Nothing planned more than $window ahead" `
+    -Singular "open item is planned more than $window ahead" -Plural "open items are planned more than $window ahead" -Detail (Get-TypeCounts $items)
+}
+
+# ---- State and fields (WRK8xx)
+function Rule_WRK800_ItemsAreNotClosedInBatches {
   # Closed means the DoD was met that day, not a batch at Sprint end (D21). Flags groups of
   # BatchSize or more items closed within the same minute over the last BatchWindowDays.
   param($Project)
@@ -1385,7 +2024,7 @@ function Rule_WRK700_ItemsAreNotClosedInBatches {
     -Note ("{0} of {1}+ items closed in the same minute" -f $batches, $size) -Items $items
 }
 
-function Rule_WRK710_ActiveItemsHaveAnOwner {
+function Rule_WRK810_ActiveItemsHaveAnOwner {
   # Anything in progress is assigned to someone.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
@@ -1397,7 +2036,31 @@ function Rule_WRK710_ActiveItemsHaveAnOwner {
     -Singular "active item has no owner" -Plural "active items have no owner" -Detail (Get-TypeCounts $items)
 }
 
-function Rule_WRK720_NoItemsParkedInResolved {
+function Rule_WRK815_EpicsAndFeaturesHaveAnOwner {
+  # Every open Epic and Feature is assigned, whatever its state, and when the ProductOwners
+  # setting names accounts it is assigned to one of them: the PO owns the what, the team
+  # owns the flow. Names match on display name or email, case-insensitively.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $owners = @(Get-SettingList 'ProductOwners' @())
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter @('Epic', 'Feature')) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State,AssignedToUserSK" -Expand "Area(`$select=AreaPath),AssignedTo(`$select=UserName,UserEmail)"
+  $items = @(foreach ($w in $rows) {
+    if (-not $w.AssignedToUserSK) { New-WorkItemRow $Project $w "$($w.State) with nobody assigned"; continue }
+    if ($owners.Count -eq 0) { continue }
+    $name = [string]$w.AssignedTo.UserName; $mail = [string]$w.AssignedTo.UserEmail
+    if (-not ($owners | Where-Object { $_ -ieq $name -or $_ -ieq $mail })) { New-WorkItemRow $Project $w "Assigned to $name, not a Product Owner" }
+  })
+  if ($owners.Count -gt 0) {
+    Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Epic and Feature is assigned to a Product Owner" `
+      -Singular "open Epic or Feature is not assigned to a Product Owner" -Plural "open Epics and Features are not assigned to a Product Owner" -Detail (Get-TypeCounts $items)
+  } else {
+    Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Epic and Feature has an owner" `
+      -Singular "open Epic or Feature has no owner" -Plural "open Epics and Features have no owner" -Detail (Get-TypeCounts $items)
+  }
+}
+
+function Rule_WRK820_NoItemsParkedInResolved {
   # Resolved is inside the Cycle Time span, not a place to park work (D11, D21). Flags
   # items that have sat in the Resolved category longer than ResolvedMaxDays.
   param($Project)
@@ -1411,23 +2074,23 @@ function Rule_WRK720_NoItemsParkedInResolved {
     -Singular "item has sat in Resolved for over $days days" -Plural "items have sat in Resolved for over $days days" -Detail (Get-TypeCounts $items)
 }
 
-# ---- Fields
-function Rule_WRK800_SprintItemsHaveAnEstimate {
-  # Every Story or Bug in a sprint carries an estimate (D8, D13). The field name comes
-  # from the EstimateField setting (StoryPoints on Agile, Effort on Scrum).
+function Rule_WRK850_SprintItemsHaveAnEstimate {
+  # Every Story, and every Bug when Bugs are managed as requirements (BugsAreRequirements
+  # setting), in a sprint carries an estimate (D8, D13). The field name comes from the
+  # EstimateField setting (StoryPoints on Agile, Effort on Scrum).
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
   $field = [string](Get-Setting 'EstimateField' 'StoryPoints')
   $rows = Get-AnalyticsWorkItems -Project $Project `
-    -Filter ((New-TypeFilter ($script:StoryTypes + @('Bug'))) + (Get-OpenFilter) + " and $field eq null") `
+    -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter) + " and $field eq null") `
     -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
   $items = @($rows | Where-Object { Test-IsSprint $_.Iteration } |
     ForEach-Object { New-WorkItemRow $Project $_ "No $field in $($_.Iteration.IterationPath)" })
-  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Story and Bug in a sprint has an estimate" `
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every requirement in a sprint has an estimate" `
     -Singular "sprint item has no estimate" -Plural "sprint items have no estimate" -Detail (Get-TypeCounts $items)
 }
 
-# ---- Staleness
+# ---- Flow and staleness (WRK9xx)
 function Rule_WRK900_NoStaleOpenItems {
   # Nothing open has gone untouched for more than StaleDays.
   param($Project)

@@ -28,14 +28,15 @@
   | Rule   | Description                                   | Status | Notes                                        |
   |:-------|:----------------------------------------------|:------:|:---------------------------------------------|
   | **CFG (Configuration)** |                              |        |                                              |
-  | CFG000 | Hub project uses hub process                  | 🟡     | On Agile, not Contoso Scrum                  |
-  | CFG100 | Project has expected services enabled         | 🟢     | On: Boards                                   |
+  | CFG000 | Project uses expected process                 | 🟡     | Hub uses Agile, expected Contoso Scrum       |
+  | CFG100 | Project has expected services enabled         | 🟢     | Boards                                       |
   | CFG110 | Project does not have unexpected services enabled | 🟡 | Unexpected: Repos, Pipelines                 |
   | CFG160 | Iterations have dates                         | 🟢     | Every sprint has dates (12 checked)          |
+  | CFG190 | Iterations follow the same cadence            | 🟢     | All sprints run Wednesday to Tuesday         |
   | **WRK (Work Items)** |                                 |        |                                              |
-  | WRK110 | Features have parent Epic                     | 🟡     | 40 open Features lack a parent Epic          |
-  | WRK300 | Closed Epics have no open children            | 🟡     | 3 open Features sit under closed Epics       |
-  | WRK700 | Items are not closed in batches               | 🟢     | No batch closing in the last 90 days         |
+  | WRK110 | Closed Epics have no open children            | 🟡     | 3 open Features sit under closed Epics       |
+  | WRK200 | Features have parent Epic                     | 🟡     | 40 open Features lack a parent Epic          |
+  | WRK800 | Items are not closed in batches               | 🟢     | No batch closing in the last 90 days         |
   | WRK900 | No stale open items                           | 🟡     | 12 open items untouched for over 90 days     |
   ```
 
@@ -122,14 +123,14 @@
   | Code | Git repositories and TFVC |
   | Graph | Teams and permissions rules, when you enable them |
   | Packaging | Artifact feeds |
-  | Project and Team | Project list, process name, area and iteration trees, team settings |
+  | Project and Team | Project list, process name, area and iteration trees, teams and their members |
   | Release | Classic release pipelines |
-  | Work Items | Parent lookups across projects |
+  | Work Items | Parent lookups across projects, text fields, links, work item type fields |
 
   Two limits worth knowing. Analytics refuses Stakeholder accounts, so the PAT owner needs
   Basic or higher plus the "View analytics" project permission that Readers and
   Contributors have by default; Analytics can also lag live data by a few minutes. And
-  CFG100 and CFG110, the rules that read which services a project has switched on, need a
+  CFG100, CFG110 and their hub and spoke twins CFG120 to CFG132, the rules that read which services a project has switched on, need a
   PAT scope the token page does not offer. The next section explains.
 
   ### CFG100, CFG110 and the hidden scope
@@ -182,64 +183,6 @@
   `ado-cop.ps1` itself stays GET-only whatever the PAT can do. If you would rather not add
   the scope, switch CFG100 and CFG110 off and read the Overview page in the browser.
 
-  ## Running as a pipeline
-
-  `pipeline.yml` runs the same script on a Linux agent on a weekday schedule and publishes
-  the report as a pipeline artifact. Every warning or error is also logged as a pipeline
-  issue, and the job finishes as "succeeded with issues" when any rule did not pass, so the
-  run summary shows the state at a glance.
-
-  Setup:
-
-  1. Create a pipeline from `pipeline.yml`.
-  2. Add a secret variable named `adoToken` holding a PAT with the Read scopes below. The
-     pipeline's own `$(System.AccessToken)` also works if the build identity has been given
-     access to every project you inspect.
-  3. Edit the `-Projects` list in the YAML.
-
-  ## PAT scopes
-
-  Create the PAT as a custom-defined token and tick **Read** only. No Write, Manage or Full
-  access scope is ever needed.
-
-  The scopes below are in the order the token page lists them.
-
-  | Scope (Read) | Used for |
-  |:--|:--|
-  | Analytics | Work item queries for every WRK rule |
-  | Build | Build pipelines |
-  | Code | Git repositories and TFVC |
-  | Graph | Teams and permissions rules, when you enable them |
-  | Packaging | Artifact feeds |
-  | Project and Team | Project list, process name, area and iteration trees, team settings |
-  | Release | Classic release pipelines |
-  | Work Items | Parent lookups across projects |
-
-  Two limits worth knowing. Analytics refuses Stakeholder accounts, so the PAT owner needs
-  Basic or higher plus the "View analytics" project permission that Readers and
-  Contributors have by default; Analytics can also lag live data by a few minutes. And the
-  Feature Management API that says which services a project has enabled (CFG100) is gated
-  by a scope the token page never shows, `vso.features`. Without it the API returns a bare
-  401 whatever else is ticked, which is why CFG100 is off by default and reports the
-  limitation if you switch it on.
-
-  ### The hidden scope for CFG100
-
-  `vso.features` can only be set through the PAT lifecycle API, and that API accepts an
-  Entra ID sign-in rather than a PAT. `tools\Add-PatFeaturesScope.ps1` does it for you: it
-  signs you in through the browser (using the MSAL library inside the
-  `Microsoft.Graph.Authentication` PowerShell module), lists your PATs with their real scope
-  strings, and with `-Apply` appends `vso.features` to the one you name. The token string
-  does not change, so Credential Manager needs no update; allow a minute for the scope to
-  propagate.
-
-  ```powershell
-  .\tools\Add-PatFeaturesScope.ps1 -Org <organization> -Tenant <tenant.com> -DisplayName <pat-name> -Apply
-  ```
-
-  It is the only file in the repository that issues anything other than GET, and it
-  touches only your own token. `ado-cop.ps1` itself stays GET-only whatever the PAT can do.
-
   ## The rules file
 
   `rules.json` is a flat object with three kinds of key:
@@ -256,17 +199,27 @@
   |:--|:--|:--|:--|
   | `PatEntryName` | `ado-cop-PAT` | credential lookup | The Windows Credential Manager entry that holds the PAT when `-AdoToken` and `-PatEntryName` are not passed. The name only; the token stays in Credential Manager |
   | `MaxLogItems` | `50` | the log | Most items a rule lists in `ado-cop.log`; the rest are counted on a closing line. `0` lists everything. The JSON always holds every item |
-  | `Project`, `ExpectedProcess` | none | CFG rules | The project that holds the work items, and the process it should be on. In a hub and spoke layout this is the hub. Leave empty to skip the process check |
-  | `ExpectedServices` | none | CFG100, CFG110 | Comma-separated services that should be on in the project: any of `Boards`, `Repos`, `Pipelines`, `Test Plans`, `Artifacts`. A hub lists `Boards`. CFG100 flags listed services that are off; CFG110 flags services that are on but not listed. Leave empty to just see what is on |
-  | `HubSpokeModel` | `true` | report wording | `true` when the organization keeps all work items in one hub project and code in spoke projects; the CFG rules are worded around the hub. `false` keeps every rule's logic and drops the hub wording from titles and notes |
+  | `ProjectModel` | `Standard` | process and services rules | `Standard`: one project holds work and code, checked by CFG000, CFG100 and CFG110 through `Project`, `ExpectedProcess` and `ExpectedServices`. `HubSpoke`: a hub holds the work items and spokes hold the code, checked by CFG002, CFG004 and CFG120 to CFG132 through the `Hub*` and `Spoke*` settings. Switch on the family that matches; a rule from the other family reports red |
+  | `Project`, `ExpectedProcess`, `ExpectedServices` | none | CFG000, CFG100, CFG110 | Standard model: the project to hold to the process and to the comma-separated services (any of `Boards`, `Repos`, `Pipelines`, `Test Plans`, `Artifacts`). An empty `Project` applies them to every inspected project; an empty process or service list skips that check. CFG100 flags listed services that are off; CFG110 flags services that are on but not listed |
+  | `HubProject`, `ExpectedHubProcess`, `ExpectedHubServices` | none | CFG002, CFG120, CFG122 | HubSpoke model: the hub project, its process, and its services (a hub lists `Boards`). These rules read the named project directly, so they run once whatever `-Projects` says |
+  | `SpokeProjects`, `ExpectedSpokeProcess`, `ExpectedSpokeServices` | none | CFG004, CFG130, CFG132 | HubSpoke model: the comma-separated spoke projects, their process, and their services (spokes usually list `Repos, Pipelines, Artifacts`). An empty process or service list just reports what each spoke uses |
   | `WriteLog` | `false` | output | Also write `ado-cop.log`, the per-item listing behind every warning |
   | `WriteJson` | `false` | output | Also write `ado-cop.json`, every result and every item, for tooling |
   | `IgnoreStateCategories` | `Completed,Removed` | every WRK rule | State categories that do not count as open |
-  | `SprintMaxDays` | `21` | iteration rules | An iteration spanning this many days or fewer is a sprint; longer ones are PIs or releases |
-  | `ResolvedMaxDays` | `30` | WRK720 | Days an item may sit in the Resolved category before it counts as parked |
+  | `SprintMaxDays` | `21` | iteration rules | An iteration spanning this many days or fewer is a sprint; longer ones are PIs or releases. CFG180 and CFG190 compare only sprints |
+  | `ResolvedMaxDays` | `30` | WRK820 | Days an item may sit in the Resolved category before it counts as parked |
   | `StaleDays` | `90` | WRK900 | Days without a change before an open item counts as stale |
-  | `BatchWindowDays`, `BatchSize` | `90`, `5` | WRK700 | Look back this many days; this many items closed in one minute is a batch |
-  | `EstimateField` | `StoryPoints` | WRK800 | The Analytics estimate column: `StoryPoints` on Agile, `Effort` on Scrum |
+  | `BatchWindowDays`, `BatchSize` | `90`, `5` | WRK800 | Look back this many days; this many items closed in one minute is a batch |
+  | `EstimateField` | `StoryPoints` | WRK850, WRK370 | The Analytics estimate column: `StoryPoints` on Agile, `Effort` on Scrum |
+  | `BugsAreRequirements` | `true` | WRK360, WRK370, WRK600, WRK850, WRK980 | `true` when the teams manage Bugs on the backlog alongside Stories, so the sprint-item rules include Bugs; `false` when Bugs are managed as Tasks |
+  | `SprintMaxEstimate` | `8` | WRK370 | Largest estimate a Story or Bug may carry inside a sprint |
+  | `PlanAheadSprints` | `1` | WRK785 | How many sprints past the current one may hold open items |
+  | `ProductOwners` | none | WRK815 | Comma-separated display names or emails; when set, every open Epic and Feature must be assigned to one of them. Empty means any owner will do |
+  | `CycleWindowDays` | `90` | WRK980 | Look back this many days at completed Stories and Bugs when comparing Cycle Time to sprint length |
+  | `SprintNamePattern` | none | CFG157 | Regular expression every sprint name must match, `^Sprint (\d{3})$` say; a captured number must run without gaps. Empty skips the check |
+  | `SprintLengthDays` | none | CFG180 | The agreed sprint length; when set, every sprint must be exactly this long, otherwise the most common length is the norm. Keep it at or below `SprintMaxDays` |
+  | `ExpectedTeams` | none | CFG305, CFG307 | Comma-separated team names the project should have. CFG305 flags listed teams that are missing; CFG307 flags teams that exist but are not listed. Empty just lists the teams |
+  | `TeamMaxMembers` | `10` | CFG315 | Most members a team may have |
 
   Every active rule runs once per project, in the order the keys appear. `rules.md` is the
   human-readable catalogue: every rule number, what it checks, why it matters, and which
@@ -275,12 +228,16 @@
   ## Rule families
 
   Rule IDs are three letters and three digits. The letters are the family; the digits leave
-  room, a new hundred when the idea changes and the next ten within an idea.
+  room, a new hundred when the idea changes and the next ten within an idea. In the WRK
+  family the hundreds are work item types: WRK1xx Epics, WRK2xx Features, WRK3xx Stories,
+  WRK4xx Bugs, WRK5xx Tasks, WRK6xx testing, and WRK7xx to WRK9xx for rules that
+  span types or sit beside the work items (hierarchy and placement, state and fields, flow
+  and staleness).
 
   | Family | Covers | Examples |
   |:--|:--|:--|
-  | CFG | Project and process configuration: process, services, areas, iterations, teams, hub and spoke shape | CFG000 hub project uses the hub process; CFG160 iterations have dates; CFG180 consistent iteration lengths |
-  | WRK | Work item hygiene: parent chain, rollup, placement, closing discipline, ownership, estimates, staleness | WRK110 features have a parent epic; WRK300 closed epics have no open children; WRK700 items are not closed in batches |
+  | CFG | Project and process configuration: process, services, areas, iterations, teams, hub and spoke shape | CFG000 project uses the expected process; CFG160 iterations have dates; CFG190 iterations follow the same cadence |
+  | WRK | Work item hygiene: parent chain, rollup, placement, closing discipline, ownership, estimates, staleness | WRK200 features have a parent epic; WRK110 closed epics have no open children; WRK800 items are not closed in batches |
   | REP | Repositories and branch policy | planned |
   | PIP | Pipelines and their settings | planned |
   | FED | Artifact feeds | planned |
@@ -321,6 +278,10 @@
     rules only see parents in the same project, which is the right answer for a hub.
   - "Open" means every state category except Completed and Removed, so Resolved counts as
     open. Adjust `IgnoreStateCategories` if your process disagrees.
+  - Analytics reports items in a Removed state with an empty `StateCategory`, and its `ne`
+    filter follows SQL rules and drops nulls, so `StateCategory ne 'Removed'` still excludes
+    them. A rule that wants the Removed items must ask for `StateCategory eq 'Removed' or
+    StateCategory eq null` (`Get-RemovedFilter`); `eq 'Removed'` alone finds nothing.
   - The report, log and JSON name work items by ID and title. They are client data. Do not
     commit them, and scrub anything you use as a sample. `.gitignore` excludes the default
     output names.

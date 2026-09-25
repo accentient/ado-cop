@@ -4,8 +4,9 @@
 
 # Client engagements. Each client gets a folder under clients/<name>/ holding its
 # rules file, annotated rule catalogue, pipeline and run reports. None of it is
-# committed; the folder as a whole is ignored.
-clients/
+# committed, apart from clients/example/, the anonymized template for a client folder.
+clients/*
+!clients/example/
 
 # Run outputs. The report, its log and its JSON name real work items by ID and title.
 # This covers the default names next to the script and any dated report anywhere.
