@@ -1,5 +1,5 @@
 # Adds the hidden vso.features scope to one of your existing Azure DevOps PATs so that
-# CFG100 can read which services a project has enabled.
+# CFG100, CFG110 and CFG120 to CFG132 can read which services a project has enabled.
 #
 # The token page never shows this scope, and the Feature Management API answers a bare
 # 401 to any PAT without it. The PAT lifecycle API can set it, but that API accepts only

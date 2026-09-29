@@ -130,10 +130,66 @@
   Two limits worth knowing. Analytics refuses Stakeholder accounts, so the PAT owner needs
   Basic or higher plus the "View analytics" project permission that Readers and
   Contributors have by default; Analytics can also lag live data by a few minutes. And
-  CFG100, CFG110 and their hub and spoke twins CFG120 to CFG132, the rules that read which services a project has switched on, need a
-  PAT scope the token page does not offer. The next section explains.
+  CFG100, CFG110 and their hub and spoke twins CFG120 to CFG132, the rules that read which
+  services a project has switched on, need a PAT scope the token page does not offer. The
+  next section explains.
 
-  ### CFG100, CFG110 and the hidden scope
+  ### The hidden vso.features scope (CFG100 to CFG132)
+
+  Without this scope, CFG100, CFG110, CFG120, CFG122, CFG130 and CFG132 come back red with
+  "PAT lacks the vso.features scope". To enable them, add the scope to the PAT that
+  ado-cop uses:
+
+  1. **Install the sign-in module once.** The tool borrows the MSAL library from the
+     Microsoft Graph PowerShell module. It is Windows-only.
+
+     ```powershell
+     Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+     ```
+
+     Answer Y to the "Untrusted repository" prompt (PSGallery's default). A warning that a
+     version is already installed means you can skip this step.
+
+  2. **Find the tenant.** It is the Entra tenant the organization is connected to (a domain
+     such as `contoso.com`, or its GUID). Any anonymous request returns it in the
+     `X-VSS-ResourceTenant` header (PowerShell 7):
+
+     ```powershell
+     (Invoke-WebRequest https://dev.azure.com/<organization>/_apis/connectionData -MaximumRedirection 0 -SkipHttpErrorCheck -ErrorAction Ignore).Headers['X-VSS-ResourceTenant']
+     ```
+
+  3. **List your PATs.** Sign in, in the browser that opens, as the account that owns the
+     PAT. Nothing changes on this run. Note the PAT's name exactly as the listing shows it;
+     it is the name on the token page, which need not match the Credential Manager entry.
+
+     ```powershell
+     .\tools\Add-PatFeaturesScope.ps1 -Org <organization> -Tenant <tenant> -DisplayName <pat-name>
+     ```
+
+  4. **Add the scope.** Run it again with `-Apply`. Pass `-CredEntry` with the Credential
+     Manager entry that holds the same PAT and the tool also tests the Feature Management
+     call, retrying for two minutes while the scope propagates.
+
+     ```powershell
+     .\tools\Add-PatFeaturesScope.ps1 -Org <organization> -Tenant <tenant> -DisplayName <pat-name> -Apply -CredEntry <entry-name>
+     ```
+
+     The test should end with "Boards state = ... The scope works." The token string does
+     not change, so Credential Manager and pipeline secrets need no update.
+
+  5. **Switch the rules on and rerun.** CFG100 and CFG110 for a single project, or CFG120
+     to CFG132 for hub and spoke (`ProjectModel`), with `ExpectedServices`, or
+     `ExpectedHubServices` and `ExpectedSpokeServices`, set in the rules file.
+
+  Repeat steps 3 and 4 for every PAT that runs ado-cop, including the one in a pipeline's
+  `adoToken` secret. `$(System.AccessToken)` cannot carry the scope, so a pipeline that uses
+  it must switch these rules off. When the PAT is regenerated or replaced, check the scope
+  is still there with step 3.
+
+  If you would rather not add the scope, switch those rules off and read Project settings,
+  Overview, "Azure DevOps services" in the browser.
+
+  #### Why the scope is hidden
 
   CFG100 and CFG110 read the switches under Project settings, Overview, "Azure DevOps
   services" through the Feature Management API:
@@ -163,25 +219,17 @@
   maintainers; it is simply not on the token page. It can only be set through the PAT
   lifecycle API, `PUT https://vssps.dev.azure.com/{org}/_apis/tokens/pats`, which refuses
   PATs and wants an Entra ID sign-in. The scope takes about a minute to propagate, so the
-  first call after adding it may still return 401.
+  first call after adding it may still return 401. The missing checkbox is reported to
+  Microsoft as [Developer Community 11159110](https://developercommunity.visualstudio.com/t/PAT-creation-UI-has-no-option-for-the-vs/11159110)
+  (29 Sep 2026); vote for it if it affects you too.
 
-  `tools\Add-PatFeaturesScope.ps1` does all of this. It signs you in through the browser
-  using the MSAL library that ships inside the `Microsoft.Graph.Authentication` PowerShell
-  module, so nothing needs installing, lists your PATs with their real scope strings (the
-  listing alone is worth seeing: those strings are what the token page's checkboxes map
-  to), and with `-Apply` appends `vso.features` to the PAT you name. The token string does
-  not change, so Credential Manager needs no update.
-
-  ```powershell
-  .\tools\Add-PatFeaturesScope.ps1 -Org <organization> -Tenant <tenant.com> -DisplayName <pat-name>
-  .\tools\Add-PatFeaturesScope.ps1 -Org <organization> -Tenant <tenant.com> -DisplayName <pat-name> -Apply
-  ```
-
-  The tenant is the Entra tenant the organization is connected to, and you sign in with an
-  account that is a member of the organization. The tool is the one file in this
-  repository that issues anything other than GET, and it touches only your own token.
-  `ado-cop.ps1` itself stays GET-only whatever the PAT can do. If you would rather not add
-  the scope, switch CFG100 and CFG110 off and read the Overview page in the browser.
+  `tools\Add-PatFeaturesScope.ps1` does this for you. It signs you in through the browser
+  using the MSAL library inside the `Microsoft.Graph.Authentication` PowerShell module,
+  lists your PATs with their real scope strings (the listing alone is worth seeing: those
+  strings are what the token page's checkboxes map to), and with `-Apply` appends
+  `vso.features` to the PAT you name, keeping its name, expiry and token string. The tool
+  is the one file in this repository that issues anything other than GET, and it touches
+  only your own token. `ado-cop.ps1` itself stays GET-only whatever the PAT can do.
 
   ## The rules file
 
