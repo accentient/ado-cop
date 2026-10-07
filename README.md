@@ -246,23 +246,29 @@
   | Setting | Default | Used by | Meaning |
   |:--|:--|:--|:--|
   | `PatEntryName` | `ado-cop-PAT` | credential lookup | The Windows Credential Manager entry that holds the PAT when `-AdoToken` and `-PatEntryName` are not passed. The name only; the token stays in Credential Manager |
-  | `MaxLogItems` | `50` | the log | Most items a rule lists in `ado-cop.log`; the rest are counted on a closing line. `0` lists everything. The JSON always holds every item |
+  | `MaxLogItems` | `50` | the log, report details | Most items a rule lists in `ado-cop.log` and in the report's Details section; the rest are counted on a closing line. `0` lists everything. The JSON always holds every item |
   | `ProjectModel` | `Standard` | process and services rules | `Standard`: one project holds work and code, checked by CFG000, CFG100 and CFG110 through `Project`, `ExpectedProcess` and `ExpectedServices`. `HubSpoke`: a hub holds the work items and spokes hold the code, checked by CFG002, CFG004 and CFG120 to CFG132 through the `Hub*` and `Spoke*` settings. Switch on the family that matches; a rule from the other family reports red |
   | `Project`, `ExpectedProcess`, `ExpectedServices` | none | CFG000, CFG100, CFG110 | Standard model: the project to hold to the process and to the comma-separated services (any of `Boards`, `Repos`, `Pipelines`, `Test Plans`, `Artifacts`). An empty `Project` applies them to every inspected project; an empty process or service list skips that check. CFG100 flags listed services that are off; CFG110 flags services that are on but not listed |
   | `HubProject`, `ExpectedHubProcess`, `ExpectedHubServices` | none | CFG002, CFG120, CFG122 | HubSpoke model: the hub project, its process, and its services (a hub lists `Boards`). These rules read the named project directly, so they run once whatever `-Projects` says |
   | `SpokeProjects`, `ExpectedSpokeProcess`, `ExpectedSpokeServices` | none | CFG004, CFG130, CFG132 | HubSpoke model: the comma-separated spoke projects, their process, and their services (spokes usually list `Repos, Pipelines, Artifacts`). An empty process or service list just reports what each spoke uses |
   | `WriteLog` | `false` | output | Also write `ado-cop.log`, the per-item listing behind every warning |
   | `WriteJson` | `false` | output | Also write `ado-cop.json`, every result and every item, for tooling |
+  | `PipelineWarnings` | `true` | pipeline runs | `true`: each warning is also raised on the run summary and any finding marks the run amber (succeeded with issues). `false`: findings stay in the report, the run is green, and only a rule that could not run (an error) raises an issue and turns the run red |
+  | `ReportDetails` | `false` | output | Add a Details section to the Markdown report below the summary table: for every warning and error, a table of the items behind it with each ID linked to the work item. Up to `MaxLogItems` items per rule. Meant for a report published to a wiki page |
   | `IgnoreStateCategories` | `Completed,Removed` | every WRK rule | State categories that do not count as open |
   | `SprintMaxDays` | `21` | iteration rules | An iteration spanning this many days or fewer is a sprint; longer ones are PIs or releases. CFG180 and CFG190 compare only sprints |
   | `ResolvedMaxDays` | `30` | WRK820 | Days an item may sit in the Resolved category before it counts as parked |
   | `StaleDays` | `90` | WRK900 | Days without a change before an open item counts as stale |
   | `BatchWindowDays`, `BatchSize` | `90`, `5` | WRK800 | Look back this many days; this many items closed in one minute is a batch |
-  | `EstimateField` | `StoryPoints` | WRK850, WRK370 | The Analytics estimate column: `StoryPoints` on Agile, `Effort` on Scrum |
-  | `BugsAreRequirements` | `true` | WRK360, WRK370, WRK600, WRK850, WRK980 | `true` when the teams manage Bugs on the backlog alongside Stories, so the sprint-item rules include Bugs; `false` when Bugs are managed as Tasks |
+  | `EstimateField` | `StoryPoints` | WRK370, WRK372, WRK850, WRK860 | The Analytics estimate column: `StoryPoints` on Agile, `Effort` on Scrum |
+  | `BugsAreRequirements` | `true` | WRK360, WRK370, WRK372, WRK600, WRK850, WRK860, WRK980 | `true` when the teams manage Bugs on the backlog alongside Stories, so the sprint-item rules include Bugs; `false` when Bugs are managed as Tasks |
   | `SprintMaxEstimate` | `8` | WRK370 | Largest estimate a Story or Bug may carry inside a sprint |
+  | `ChallengeEstimate` | none | WRK372 | The estimate that is allowed but suspect, `5` say; every open Story or Bug sized at it is listed for the Product Owner to challenge. Empty skips the check |
+  | `EstimateScale` | none | WRK860 | Comma-separated estimates allowed on open Stories and Bugs, `1,2,3,5` say; an empty estimate is also allowed. Empty skips the check |
+  | `TaskMaxHours` | `8` | WRK560 | Most Remaining Work an open Task may carry |
+  | `EpicAreas` | the root area | WRK140 | Comma-separated area paths where Epics may live, for a portfolio with its own area; empty means the project's root area only |
   | `PlanAheadSprints` | `1` | WRK785 | How many sprints past the current one may hold open items |
-  | `ProductOwners` | none | WRK815 | Comma-separated display names or emails; when set, every open Epic and Feature must be assigned to one of them. Empty means any owner will do |
+  | `ProductOwners` | none | WRK190, WRK290, WRK395, WRK815 | Comma-separated display names or emails; when set, every open Epic and Feature (WRK815, or WRK190 and WRK290 by type) and every open Story (WRK395) must be assigned to one of them. Empty means any owner will do |
   | `CycleWindowDays` | `90` | WRK980 | Look back this many days at completed Stories and Bugs when comparing Cycle Time to sprint length |
   | `SprintNamePattern` | none | CFG157 | Regular expression every sprint name must match, `^Sprint (\d{3})$` say; a captured number must run without gaps. Empty skips the check |
   | `SprintLengthDays` | none | CFG180 | The agreed sprint length; when set, every sprint must be exactly this long, otherwise the most common length is the norm. Keep it at or below `SprintMaxDays` |

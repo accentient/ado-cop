@@ -439,7 +439,10 @@ function Add-Result {
   $color = switch ($Status) { 'Pass' { 'Green' } 'Warning' { 'Yellow' } default { 'Red' } }
   $prefix = if ($script:TargetCount -gt 1) { "$($Project.name): " } else { "" }
   Write-Host ("{0,-7} {1}{2}" -f $Status, $prefix, $Description) -ForegroundColor $color
-  if ($env:TF_BUILD -and $Status -ne $script:StatusPass) {
+  # In a pipeline, each warning and error also appears on the run summary, unless
+  # PipelineWarnings (setting) is false: then only errors do, since findings are the report's job.
+  $raise = if ($Status -eq $script:StatusError) { $true } elseif ($Status -eq $script:StatusWarning) { [bool](Get-Setting 'PipelineWarnings' $true) } else { $false }
+  if ($env:TF_BUILD -and $raise) {
     $type = if ($Status -eq $script:StatusError) { 'error' } else { 'warning' }
     Write-Host "##vso[task.logissue type=$type]$($Project.name) $Rule $Description"
   }
@@ -527,13 +530,15 @@ function Invoke-AdoCop {
   if ($outFolder -and -not (Test-Path $outFolder)) { New-Item -ItemType Directory -Path $outFolder | Out-Null }
   # The Markdown report is always written. The item log (WriteLog) and the JSON for
   # tooling (WriteJson) are settings in the rules file, both off unless switched on.
-  $markdown = New-AdoCopReport -Results $script:Results -Missing $missing -Started $started
+  # LF line endings: pasted into an Azure DevOps wiki page, CRLF text gains a blank line
+  # after every row, which breaks every table into loose paragraphs.
+  $markdown = (New-AdoCopReport -Results $script:Results -Missing $missing -Started $started) -replace "`r`n", "`n"
   [IO.File]::WriteAllText($OutputPath, $markdown, [Text.UTF8Encoding]::new($false))
   $writeLog  = [bool](Get-Setting 'WriteLog' $false)
   $writeJson = [bool](Get-Setting 'WriteJson' $false)
   $logPath  = [IO.Path]::ChangeExtension($OutputPath, '.log')
   $jsonPath = [IO.Path]::ChangeExtension($OutputPath, '.json')
-  if ($writeLog)  { [IO.File]::WriteAllText($logPath, (New-AdoCopLog -Results $script:Results -Started $started), [Text.UTF8Encoding]::new($false)) }
+  if ($writeLog)  { [IO.File]::WriteAllText($logPath, ((New-AdoCopLog -Results $script:Results -Started $started) -replace "`r`n", "`n"), [Text.UTF8Encoding]::new($false)) }
   if ($writeJson) { $script:Results | ConvertTo-Json -Depth 8 | Set-Content -Path $jsonPath -Encoding UTF8 }
 
   $warnings = @($script:Results | Where-Object { $_.Status -eq $script:StatusWarning }).Count
@@ -544,8 +549,15 @@ function Invoke-AdoCop {
   if ($writeJson) { Write-Host ("JSON:   {0}" -f $jsonPath) }
   Write-Host ""
   Write-Host ("Ending {0}" -f $finished.ToString('HH:mm:ss')) -ForegroundColor Cyan
-  if ($env:TF_BUILD -and ($warnings + $errors) -gt 0) {
-    Write-Host "##vso[task.complete result=SucceededWithIssues;]$warnings warning(s), $errors error(s)"
+  # The run's colour. By default any warning or error makes it amber (succeeded with issues).
+  # With PipelineWarnings false, warnings leave it green and an error (a rule that could not
+  # run) turns it red, so the colour says whether the check itself worked.
+  if ($env:TF_BUILD) {
+    if ([bool](Get-Setting 'PipelineWarnings' $true)) {
+      if (($warnings + $errors) -gt 0) { Write-Host "##vso[task.complete result=SucceededWithIssues;]$warnings warning(s), $errors error(s)" }
+    } elseif ($errors -gt 0) {
+      Write-Host "##vso[task.complete result=Failed;]$errors rule(s) could not run"
+    }
   }
   return $script:Results.ToArray()
 }
@@ -827,7 +839,7 @@ function Test-NamedProjectsProcess {
     Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No $ProcessSetting setting in the rules file; $usesText." -Note "No $ProcessSetting setting; $usesText"
     return
   }
-  # "IT, Foo1, Foo2 all use CWI Scrum" when they agree; otherwise each project by name.
+  # "IT, Foo1, Foo2 all use Contoso Scrum" when they agree; otherwise each project by name.
   $processes = @($uses | ForEach-Object { ($_ -split ' uses ', 2)[1] } | Select-Object -Unique)
   $summary = if ($uses.Count -gt 1 -and $processes.Count -eq 1) { "$(($uses | ForEach-Object { ($_ -split ' uses ', 2)[0] }) -join ', ') all use $($processes[0])" } else { $usesText }
   if ($items.Count -eq 0) {
@@ -1288,6 +1300,27 @@ function Rule_CFG315_TeamsAreNotOversized {
     -Detail (($sizes | ForEach-Object { "$($_.Team): $($_.Count)" }) -join ', ')
 }
 
+function Rule_CFG335_EveryAreaIsCoveredByATeam {
+  # Every area, the root included, is selected by at least one team, directly or through a
+  # parent area selected with "include sub areas"; otherwise work there is on no backlog or
+  # board. Reads each team's area settings (teamfieldvalues).
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $root = [string]$Project.name
+  $areas = @($root) + @(Get-TreeNodes (Get-ClassificationTree $Project 'area') | ForEach-Object { "$root\$($_.Path)" })
+  $covered = New-Object System.Collections.Generic.List[object]
+  foreach ($team in (Get-AdoTeams $Project)) {
+    $tfv = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/$($team.id)/_apis/work/teamsettings/teamfieldvalues?api-version=$($script:ApiVersion)")
+    foreach ($v in @($tfv.values)) { $covered.Add([pscustomobject]@{ Path = [string]$v.value; Children = [bool]$v.includeChildren }) }
+  }
+  $items = @(foreach ($a in $areas) {
+    $hit = $covered | Where-Object { $_.Path -ieq $a -or ($_.Children -and $a.StartsWith("$($_.Path)\", [System.StringComparison]::OrdinalIgnoreCase)) }
+    if (-not $hit) { New-NamedItem 'Area' $a 'No team selects this area' }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every area is covered by a team ($($areas.Count) checked)" `
+    -Singular "area has no team" -Plural "areas have no team" -Detail (($items | ForEach-Object { $_.Title }) -join ', ')
+}
+
 
 #######################################################################################################################################################################
 #                                                        RULES: WRK 1xx to 5xx (Epics, Features, Stories, Bugs, Tasks)                                                  #
@@ -1426,13 +1459,24 @@ function Test-ParentRule {
 }
 
 # ---- Parent rules, one per type
-function Rule_WRK100_EpicsHaveNoParentOrInitiative {
-  # Nothing sits above Epic (D3). An Epic may have no parent, or an Initiative while that
-  # type still exists; any other parent is flagged.
+function Rule_WRK100_NoEpicsWithAParent {
+  # Nothing sits above Epic (D3): no open Epic has a parent of any type.
   param($Project)
-  Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
-    -ChildTypes 'Epic' -Singular 'Epic' -Plural 'Epics' `
-    -ParentTypes 'Initiative' -ParentLabel 'Initiative' -AllowNoParent
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  $withParent = @($rows | Where-Object { $_.ParentWorkItemId })
+  $parents = @{}
+  if ($withParent.Count -gt 0) { $parents = Get-WorkItemFields -Ids @($withParent | ForEach-Object { [int]$_.ParentWorkItemId }) -Fields @('System.WorkItemType') }
+  $items = @(foreach ($w in $withParent) {
+    $pid_ = [int]$w.ParentWorkItemId
+    $ptype = if ($parents.ContainsKey($pid_)) { [string]$parents[$pid_].'System.WorkItemType' } else { 'item this PAT cannot read' }
+    $row = New-WorkItemRow $Project $w "Parent is $ptype $pid_"
+    $row.ParentId = $pid_; $row.ParentType = $ptype
+    $row
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Epics with a parent ($($rows.Count) checked)" `
+    -Singular "open Epic has a parent" -Plural "open Epics have a parent"
 }
 
 function Rule_WRK200_FeaturesHaveParentEpic {
@@ -1450,6 +1494,27 @@ function Rule_WRK300_StoriesHaveParentFeature {
   Test-ParentRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) `
     -ChildTypes 'User Story', 'Product Backlog Item' -Singular 'User Story' -Plural 'User Stories' `
     -ParentTypes 'Feature' -ParentLabel 'Feature'
+}
+
+function Rule_WRK305_StoriesAreNotDirectChildrenOfAnEpic {
+  # No open User Story or Product Backlog Item has an Epic as its parent; a Feature always
+  # sits between them. WRK300 counts these among its wrong parents; this rule names them alone.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + (Get-OpenFilter) + " and ParentWorkItemId ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  $parents = @{}
+  if ($rows.Count -gt 0) { $parents = Get-WorkItemFields -Ids @($rows | ForEach-Object { [int]$_.ParentWorkItemId }) -Fields @('System.WorkItemType') }
+  $items = @(foreach ($w in $rows) {
+    $pid_ = [int]$w.ParentWorkItemId
+    if ($parents.ContainsKey($pid_) -and [string]$parents[$pid_].'System.WorkItemType' -eq 'Epic') {
+      $row = New-WorkItemRow $Project $w "Parent is Epic $pid_"
+      $row.ParentId = $pid_; $row.ParentType = 'Epic'
+      $row
+    }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Stories directly under an Epic ($($rows.Count) with a parent checked)" `
+    -Singular "open Story sits directly under an Epic" -Plural "open Stories sit directly under an Epic" -Detail (Get-TypeCounts $items)
 }
 
 function Rule_WRK400_BugsHaveParent {
@@ -1649,18 +1714,61 @@ function Test-TextFieldsRule {
 }
 
 # ---- Epics (WRK1xx), continued
-function Rule_WRK160_EpicsHaveADescriptionAndAcceptanceCriteria {
-  # Every open Epic carries a value statement in the description and acceptance criteria that
-  # say how the Epic is known to be done. The criteria are required only where the type has
-  # the field.
+function Rule_WRK140_EpicsLiveInTheRootArea {
+  # Every open Epic sits in the project's root area, or in one of the EpicAreas (setting,
+  # comma-separated area paths) when the portfolio has its own area; never in a team area.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $allowed = @(Get-SettingList 'EpicAreas' @([string]$Project.name))
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | Where-Object { $area = if ($_.Area) { [string]$_.Area.AreaPath } else { "" }; -not ($allowed -contains $area) } |
+    ForEach-Object { New-WorkItemRow $Project $_ "In $($_.Area.AreaPath), not $($allowed -join ' or ')" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Epic is in $($allowed -join ' or ') ($($rows.Count) checked)" `
+    -Singular "open Epic sits outside $($allowed -join ' or ')" -Plural "open Epics sit outside $($allowed -join ' or ')"
+}
+
+function Rule_WRK160_EpicsHaveADescription {
+  # Every open Epic carries a value statement in its description: the business outcome it
+  # delivers.
   param($Project)
   $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) `
     -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
   Test-TextFieldsRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows $rows `
-    -Fields ([ordered]@{ 'System.Description' = 'description'; 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }) `
-    -PassNote "Every open Epic has a description and acceptance criteria" `
-    -Singular "open Epic lacks a description or acceptance criteria" -Plural "open Epics lack a description or acceptance criteria"
+    -Fields ([ordered]@{ 'System.Description' = 'description' }) `
+    -PassNote "Every open Epic has a description" `
+    -Singular "open Epic has no description" -Plural "open Epics have no description"
 }
+
+function Rule_WRK165_EpicsHaveAcceptanceCriteria {
+  # Every open Epic has acceptance criteria that say how the Epic is known to be done. Only
+  # where the type has the field.
+  param($Project)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  Test-TextFieldsRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows $rows `
+    -Fields ([ordered]@{ 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }) `
+    -PassNote "Every open Epic has acceptance criteria" `
+    -Singular "open Epic has no acceptance criteria" -Plural "open Epics have no acceptance criteria"
+}
+
+# ---- Fields that stay empty (WRK180, WRK185, WRK280, WRK285, WRK390)
+function Test-EmptyFieldRule {
+  # Every open item of the given types has nothing in the Analytics column named, for a
+  # client that has decided the field is not used at that level.
+  param($Project, [string]$RuleCode, [string[]]$Types, [string]$Field, [string]$Label, [string]$Plural)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $Types) + (Get-OpenFilter) + " and $Field ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,$Field" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "$Label is $($_.$Field)" })
+  Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "No open $Plural carry $Label" `
+    -Singular "open item carries $Label" -Plural "open items carry $Label" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK180_EpicsHaveNoEffort          { param($Project); Test-EmptyFieldRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Epic' -Field 'Effort' -Label 'Effort' -Plural 'Epics' }
+function Rule_WRK185_EpicsHaveNoBusinessValue   { param($Project); Test-EmptyFieldRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Epic' -Field 'BusinessValue' -Label 'Business Value' -Plural 'Epics' }
+function Rule_WRK280_FeaturesHaveNoEffort       { param($Project); Test-EmptyFieldRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Feature' -Field 'Effort' -Label 'Effort' -Plural 'Features' }
+function Rule_WRK285_FeaturesHaveNoBusinessValue { param($Project); Test-EmptyFieldRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Feature' -Field 'BusinessValue' -Label 'Business Value' -Plural 'Features' }
+function Rule_WRK390_StoriesHaveNoBusinessValue { param($Project); Test-EmptyFieldRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types $script:StoryTypes -Field 'BusinessValue' -Label 'Business Value' -Plural 'Stories' }
 
 # ---- Features (WRK2xx), continued
 function Rule_WRK270_FeaturesHaveADescription {
@@ -1703,6 +1811,29 @@ function Rule_WRK370_SprintStoriesAreNotOversized {
     ForEach-Object { New-WorkItemRow $Project $_ "$field $($_.$field) in $($_.Iteration.IterationPath), limit $max" })
   Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No sprint item is larger than $max" `
     -Singular "sprint item is larger than $max" -Plural "sprint items are larger than $max" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK372_StoriesAtTheTopOfTheScaleAreListedForChallenge {
+  # Every open Story or Bug whose estimate equals ChallengeEstimate (setting, 5 say) is listed,
+  # sprint or backlog, so the Product Owner can challenge it to be split or hear the team's
+  # case. WRK370 catches anything larger. No setting, nothing checked.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $challenge = Get-Setting 'ChallengeEstimate'
+  if ($null -eq $challenge) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No ChallengeEstimate set; nothing checked." -Note "No ChallengeEstimate set"
+    return
+  }
+  $challenge = [double]$challenge
+  $field = [string](Get-Setting 'EstimateField' 'StoryPoints')
+  $rows = Get-AnalyticsWorkItems -Project $Project `
+    -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter) + " and $field eq $challenge") `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath)"
+  $items = @($rows | ForEach-Object {
+    $where = if ($_.Iteration) { [string]$_.Iteration.IterationPath } else { "" }
+    New-WorkItemRow $Project $_ "$field $challenge in $where; split it or make the case" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open item is sized at $challenge" `
+    -Singular "open item is sized at $challenge, for challenge" -Plural "open items are sized at $challenge, for challenge" -Detail (Get-TypeCounts $items)
 }
 
 # ---- Tasks (WRK5xx), continued
@@ -1762,16 +1893,30 @@ function Rule_WRK520_TasksAreNotCreatedAheadOfTheSprint {
 }
 
 function Rule_WRK530_SprintTasksHaveRemainingWork {
-  # Every open Task in the current sprint has Remaining Work set, or the burndown is flat by
-  # construction.
+  # Every current-sprint Task still to do or in progress (the Proposed and In Progress state
+  # categories: To Do and In Progress on Scrum) has Remaining Work set, or the burndown is
+  # flat by construction.
   param($Project)
   $code = Get-RuleCode $MyInvocation.MyCommand.Name
-  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + (Get-OpenFilter) + " and RemainingWork eq null") `
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + " and (StateCategory eq 'Proposed' or StateCategory eq 'InProgress') and RemainingWork eq null") `
     -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
   $items = @($rows | Where-Object { (Get-SprintPhase $_.Iteration) -eq 'current' } |
     ForEach-Object { New-WorkItemRow $Project $_ "No Remaining Work in $($_.Iteration.IterationPath)" })
   Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Task in the current sprint has Remaining Work" `
     -Singular "current-sprint Task has no Remaining Work" -Plural "current-sprint Tasks have no Remaining Work"
+}
+
+function Rule_WRK560_TasksAreSizedAtADayOrLess {
+  # Remaining Work on an open Task is at most TaskMaxHours (setting, 8); size the task so
+  # that a day is a meaningful threshold.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [double](Get-Setting 'TaskMaxHours' 8)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + (Get-OpenFilter) + " and RemainingWork gt $max") `
+    -Select "WorkItemId,Title,WorkItemType,State,RemainingWork" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "Remaining Work $($_.RemainingWork), limit $max" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open Task has more than $max hours of Remaining Work" `
+    -Singular "open Task has more than $max hours of Remaining Work" -Plural "open Tasks have more than $max hours of Remaining Work"
 }
 
 # ---- Testing (WRK6xx)
@@ -2036,28 +2181,54 @@ function Rule_WRK810_ActiveItemsHaveAnOwner {
     -Singular "active item has no owner" -Plural "active items have no owner" -Detail (Get-TypeCounts $items)
 }
 
-function Rule_WRK815_EpicsAndFeaturesHaveAnOwner {
-  # Every open Epic and Feature is assigned, whatever its state, and when the ProductOwners
-  # setting names accounts it is assigned to one of them: the PO owns the what, the team
-  # owns the flow. Names match on display name or email, case-insensitively.
-  param($Project)
-  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+function Test-OwnerRule {
+  # Every open item of the given types is assigned, whatever its state, and when the
+  # ProductOwners setting names accounts it is assigned to one of them. Names match on
+  # display name or email, case-insensitively. Behind WRK815, WRK190, WRK290 and WRK395.
+  param($Project, [string]$RuleCode, [string[]]$Types, [string]$Singular, [string]$Plural)
   $owners = @(Get-SettingList 'ProductOwners' @())
-  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter @('Epic', 'Feature')) + (Get-OpenFilter)) `
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $Types) + (Get-OpenFilter)) `
     -Select "WorkItemId,Title,WorkItemType,State,AssignedToUserSK" -Expand "Area(`$select=AreaPath),AssignedTo(`$select=UserName,UserEmail)"
   $items = @(foreach ($w in $rows) {
     if (-not $w.AssignedToUserSK) { New-WorkItemRow $Project $w "$($w.State) with nobody assigned"; continue }
     if ($owners.Count -eq 0) { continue }
     $name = [string]$w.AssignedTo.UserName; $mail = [string]$w.AssignedTo.UserEmail
-    if (-not ($owners | Where-Object { $_ -ieq $name -or $_ -ieq $mail })) { New-WorkItemRow $Project $w "Assigned to $name, not a Product Owner" }
+    if (-not ($owners | Where-Object { $_ -ieq $name -or $_ -ieq $mail })) { New-WorkItemRow $Project $w "Assigned to $name, not the Product Owner" }
   })
   if ($owners.Count -gt 0) {
-    Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Epic and Feature is assigned to a Product Owner" `
-      -Singular "open Epic or Feature is not assigned to a Product Owner" -Plural "open Epics and Features are not assigned to a Product Owner" -Detail (Get-TypeCounts $items)
+    Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "Every open $Singular is assigned to the Product Owner ($($rows.Count) checked)" `
+      -Singular "open $Singular is not assigned to the Product Owner" -Plural "open $Plural are not assigned to the Product Owner" -Detail (Get-TypeCounts $items)
   } else {
-    Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Epic and Feature has an owner" `
-      -Singular "open Epic or Feature has no owner" -Plural "open Epics and Features have no owner" -Detail (Get-TypeCounts $items)
+    Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "Every open $Singular has an owner; no ProductOwners set ($($rows.Count) checked)" `
+      -Singular "open $Singular has no owner" -Plural "open $Plural have no owner" -Detail (Get-TypeCounts $items)
   }
+}
+
+function Rule_WRK815_EpicsAndFeaturesHaveAnOwner {
+  # Every open Epic and Feature is assigned, and to a Product Owner when ProductOwners is
+  # set: the PO owns the what, the team owns the flow. WRK190 and WRK290 are the same check
+  # one type at a time; turn on one form or the other.
+  param($Project)
+  Test-OwnerRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types @('Epic', 'Feature') -Singular 'Epic or Feature' -Plural 'Epics and Features'
+}
+
+function Rule_WRK190_EpicsAreAssignedToTheProductOwner {
+  # Every open Epic is assigned to one of the ProductOwners (setting).
+  param($Project)
+  Test-OwnerRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Epic' -Singular 'Epic' -Plural 'Epics'
+}
+
+function Rule_WRK290_FeaturesAreAssignedToTheProductOwner {
+  # Every open Feature is assigned to one of the ProductOwners (setting).
+  param($Project)
+  Test-OwnerRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types 'Feature' -Singular 'Feature' -Plural 'Features'
+}
+
+function Rule_WRK395_StoriesAreAssignedToTheProductOwner {
+  # Every open User Story or Product Backlog Item is assigned to one of the ProductOwners
+  # (setting); the Product Owner owns the backlog item, the doers own its Tasks.
+  param($Project)
+  Test-OwnerRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Types $script:StoryTypes -Singular 'Story' -Plural 'Stories'
 }
 
 function Rule_WRK820_NoItemsParkedInResolved {
@@ -2088,6 +2259,27 @@ function Rule_WRK850_SprintItemsHaveAnEstimate {
     ForEach-Object { New-WorkItemRow $Project $_ "No $field in $($_.Iteration.IterationPath)" })
   Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every requirement in a sprint has an estimate" `
     -Singular "sprint item has no estimate" -Plural "sprint items have no estimate" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK860_EstimatesAreOnTheAgreedScale {
+  # Every open Story, and every Bug when BugsAreRequirements is on, carries either no
+  # estimate or one of the values in EstimateScale (setting, comma-separated: 1,2,3,5 say).
+  # An empty estimate is WRK850's business. No setting, nothing checked.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $scale = @(Get-SettingList 'EstimateScale' | ForEach-Object { [double]$_ })
+  if ($scale.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No EstimateScale set; nothing checked." -Note "No EstimateScale set"
+    return
+  }
+  $field = [string](Get-Setting 'EstimateField' 'StoryPoints')
+  $rows = Get-AnalyticsWorkItems -Project $Project `
+    -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter) + " and $field ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,$field" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | Where-Object { $scale -notcontains [double]$_.$field } |
+    ForEach-Object { New-WorkItemRow $Project $_ "$field $($_.$field), not one of $($scale -join ', ')" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every estimate is empty or one of $($scale -join ', ') ($($rows.Count) checked)" `
+    -Singular "open item has an estimate off the scale" -Plural "open items have an estimate off the scale" -Detail (Get-TypeCounts $items)
 }
 
 # ---- Flow and staleness (WRK9xx)
@@ -2209,6 +2401,40 @@ function New-AdoCopReport {
     & $add "| $(MdCell $r.Rule) | $name | $(Get-StatusGlyph $r.Status) | $(MdCell $r.Note) |"
   }
   & $add ""
+
+  # With ReportDetails (setting) on, every warning and error is followed below the table by
+  # the items behind it, one section per rule, so a wiki reader can scroll to a rule and open
+  # each work item. Each rule lists at most MaxLogItems items, as in the log.
+  if ([bool](Get-Setting 'ReportDetails' $false)) {
+    $max = [int](Get-Setting 'MaxLogItems' 50)
+    $flagged = @($Results | Where-Object { $_.Status -ne $script:StatusPass } | Sort-Object Rule, Project)
+    & $add "## Details"
+    & $add ""
+    if ($flagged.Count -eq 0) { & $add "Nothing to report: every rule passed."; & $add "" }
+    foreach ($r in $flagged) {
+      $where = if ($projects.Count -gt 1) { " ($($r.Project))" } else { "" }
+      & $add "### $(MdCell $r.Title)$where"
+      & $add ""
+      & $add "$(Get-StatusGlyph $r.Status) $(MdCell $r.Description)"
+      & $add ""
+      $items = @($r.Items)
+      if ($items.Count -eq 0) { continue }
+      $shown = if ($max -gt 0 -and $items.Count -gt $max) { $items[0..($max - 1)] } else { $items }
+      & $add "| ID | Type | State | Problem | Title | Area |"
+      & $add "|:--|:--|:--|:--|:--|:--|"
+      foreach ($i in $shown) {
+        $id = if ($i.Url -and $i.Id) { "[$($i.Id)]($($i.Url))" } elseif ($i.Id) { [string]$i.Id } else { "" }
+        $problem = [string]$i.Problem
+        if ($i.ParentId -and $problem -notmatch "\b$($i.ParentId)\b") { $problem += " (parent $($i.ParentId))" }
+        & $add "| $id | $(MdCell $i.Type) | $(MdCell $i.State) | $(MdCell $problem) | $(MdCell $i.Title) | $(MdCell $i.AreaPath) |"
+      }
+      & $add ""
+      if ($items.Count -gt @($shown).Count) {
+        & $add ("_... and {0} more, {1} in all. Set MaxLogItems to 0 in rules.json to list every item._" -f ($items.Count - @($shown).Count), $items.Count)
+        & $add ""
+      }
+    }
+  }
 
   $elapsed = (Get-Date) - $Started
   & $add "_$([int]$elapsed.TotalSeconds) seconds, read-only REST calls, ado-cop.ps1._"
