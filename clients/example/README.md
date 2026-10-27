@@ -23,3 +23,10 @@ To run locally from the repo root:
   -Projects Hub -RulesFile .\clients\example\rules.json `
   -OutputPath ".\clients\example\report $(Get-Date -Format yyyy-MM-dd).md"
 ```
+
+## Keeping it anonymized
+
+When refreshing `example-report.md` or `example-report.log` from a real run, re-scrub it
+before committing. Replace the organization name, work item titles, area paths and team
+names with Contoso placeholders, and remove any assignee names or emails. Work item IDs
+can stay, since they mean nothing outside the organization.

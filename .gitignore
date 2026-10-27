@@ -1,6 +1,6 @@
 # ado-cop is a public repo. Anything that names a client, its organization, its
 # work items or its credentials stays local. The only rules, pipelines and reports
-# that belong here are the anonymized examples at the repo root.
+# that belong here are the anonymized examples in clients/example/.
 
 # Client engagements. Each client gets a folder under clients/<name>/ holding its
 # rules file, annotated rule catalogue, pipeline and run reports. None of it is
