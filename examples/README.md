@@ -1,8 +1,9 @@
 # Contoso (example client folder)
 
-A scrubbed copy of what a client folder under `clients/` looks like. Every other folder
-here is ignored by git because it names a real organization, its work items and its
-people; this one is committed as the template. Copy it to `clients/<name>/`, then edit.
+A scrubbed copy of what a client folder looks like. Real client folders live under
+`clients/<name>/`, which git ignores because each names a real organization, its work
+items and its people; this one is committed as the template. Copy it to
+`clients/<name>/`, then edit.
 
 | File | What it is |
 |:--|:--|
@@ -20,8 +21,8 @@ To run locally from the repo root:
 
 ```powershell
 .\ado-cop.ps1 -AdoOrgUrl https://dev.azure.com/contoso/ `
-  -Projects Hub -RulesFile .\clients\example\rules.json `
-  -OutputPath ".\clients\example\report $(Get-Date -Format yyyy-MM-dd).md"
+  -Projects Hub -RulesFile .\examples\rules.json `
+  -OutputPath ".\examples\report $(Get-Date -Format yyyy-MM-dd).md"
 ```
 
 ## Keeping it anonymized

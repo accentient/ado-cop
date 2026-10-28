@@ -38,7 +38,7 @@ jobs:
         -AdoOrgUrl '$(System.CollectionUri)'
         -AdoToken '$(adoToken)'
         -Projects 'Hub'
-        -RulesFile '$(Build.SourcesDirectory)/clients/example/rules.json'
+        -RulesFile '$(Build.SourcesDirectory)/examples/rules.json'
         -OutputPath '$(Build.ArtifactStagingDirectory)/ado-cop.md'
 
   - task: PublishPipelineArtifact@1
