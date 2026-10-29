@@ -29,6 +29,7 @@
   "PlanAheadSprints": 1,
   "ProductOwners": "Pat Owner, sam.owner@contoso.com",
   "CycleWindowDays": 90,
+  "ReadyState": "Ready",
   "Test_Rule": "",
   "CFG000_ProjectUsesExpectedProcess": false,
   "CFG002_HubProjectUsesExpectedProcess": true,
