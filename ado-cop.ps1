@@ -155,6 +155,8 @@ function Connect-Ado {
   $script:AnalyticsBase = "https://analytics.dev.azure.com/$org/"
   $script:ReleaseBase   = "https://vsrm.dev.azure.com/$org/"
   $script:FeedsBase     = "https://feeds.dev.azure.com/$org/"
+  $script:ExtMgmtBase   = "https://extmgmt.dev.azure.com/$org/"
+  $script:EntitlementBase = "https://vsaex.dev.azure.com/$org/"
 
   $pat = Get-AdoPat
   $bytes = [Text.Encoding]::ASCII.GetBytes(":" + $pat)
@@ -481,6 +483,13 @@ function Invoke-AdoCop {
   $script:ProcessMap   = $null
   $script:TeamCache    = @{}
   $script:TypeFieldCache = @{}
+  $script:EntitlementCache = $null
+  $script:ProcessIdCache   = @{}
+  $script:ProcessTypeCache = @{}
+  $script:TypeStateCache   = @{}
+  $script:TeamBacklogCache = @{}
+  $script:QueryPathCache   = @{}
+  $script:BacklogLevelCache = @{}
   $script:Results      = New-Object System.Collections.Generic.List[object]
   $script:RuleTitles   = @{}
 
@@ -1883,7 +1892,7 @@ function Rule_WRK520_TasksAreNotCreatedAheadOfTheSprint {
     $phase = Get-SprintPhase $p.Iteration
     if ($phase -eq 'current' -or $phase -eq 'past') { continue }
     $path = if ($p.Iteration) { [string]$p.Iteration.IterationPath } else { "" }
-    $problem = if ($phase -eq 'future') { "Parent $($p.WorkItemType) $($p.WorkItemId) is in $path, which starts $((ConvertTo-UtcDate ([string]$p.Iteration.StartDate)).ToString('yyyy-MM-dd'))" }
+    $problem = if ($phase -eq 'future') { "Parent $($p.WorkItemType) $($p.WorkItemId) is in $path, which starts $((ConvertTo-IterationDay $p.Iteration.StartDate).ToString('yyyy-MM-dd'))" }
                else { "Parent $($p.WorkItemType) $($p.WorkItemId) is not in a sprint ($path)" }
     $row = New-WorkItemRow $Project $w $problem
     $row.ParentId = [int]$p.WorkItemId; $row.ParentType = [string]$p.WorkItemType
@@ -1974,27 +1983,52 @@ function New-WorkItemRow($Project, $W, [string]$Problem) {
   }
 }
 
+function ConvertTo-IterationDay($Value, [switch]$End) {
+  # The calendar day an Analytics iteration date stands for. Analytics gives a sprint's
+  # start as midnight and its end as 23:59:59.999 in the organization's time zone, with the
+  # offset; PowerShell 7 turns that into the machine's local time and Windows PowerShell
+  # keeps the text. Converting either to UTC moves the end into the next day west of
+  # Greenwich (a Mountain-time sprint ending Tuesday night ends Wednesday morning UTC) and
+  # the start into the previous day east of it. On a UTC build agent a 21-day sprint then
+  # measured 22 days, failed SprintMaxDays, and every sprint rule found no sprints. Moving
+  # twelve hours toward the middle of the day first lands on the right day for any offset.
+  # Iteration dates from the REST classification nodes are UTC midnights; use
+  # ConvertTo-UtcDate for those.
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+  $hours = if ($End) { -12 } else { 12 }
+  return (ConvertTo-UtcInstant $Value).AddHours($hours).Date
+}
+
+function ConvertTo-UtcInstant($Value) {
+  # A date from a JSON payload as a UTC DateTime: PowerShell 7 hands over a local DateTime,
+  # Windows PowerShell the ISO text with its offset.
+  if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+  if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+  if ($Value -is [datetime]) { return ([DateTimeOffset]$Value).UtcDateTime }
+  return [DateTimeOffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+}
+
 function Test-IsSprint($Iteration) {
   # A sprint is an iteration with dates spanning no more than SprintMaxDays. Depth cannot
   # tell: some organizations keep 90-day PI nodes and 14-day sprints side by side under the root.
   if (-not $Iteration -or -not $Iteration.StartDate -or -not $Iteration.EndDate) { return $false }
-  $days = ([datetime]$Iteration.EndDate).Date.Subtract(([datetime]$Iteration.StartDate).Date).TotalDays + 1
-  return ($days -le [int](Get-Setting 'SprintMaxDays' 21))
+  return ((Get-SprintDays $Iteration) -le [int](Get-Setting 'SprintMaxDays' 21))
 }
 
 function Get-SprintPhase($Iteration) {
   # 'past', 'current' or 'future' for a sprint (see Test-IsSprint); $null for anything else.
   if (-not (Test-IsSprint $Iteration)) { return $null }
   $today = (Get-Date).ToUniversalTime().Date
-  $start = ConvertTo-UtcDate ([string]$Iteration.StartDate)
-  $end   = ConvertTo-UtcDate ([string]$Iteration.EndDate)
+  $start = ConvertTo-IterationDay $Iteration.StartDate
+  $end   = ConvertTo-IterationDay $Iteration.EndDate -End
   if ($end -lt $today) { return 'past' }
   if ($start -gt $today) { return 'future' }
   return 'current'
 }
 
 function Get-SprintDays($Iteration) {
-  return [int]((ConvertTo-UtcDate ([string]$Iteration.EndDate)) - (ConvertTo-UtcDate ([string]$Iteration.StartDate))).TotalDays + 1
+  # Length of an Analytics iteration in calendar days, first and last day included.
+  return [int]((ConvertTo-IterationDay $Iteration.EndDate -End) - (ConvertTo-IterationDay $Iteration.StartDate)).TotalDays + 1
 }
 
 function Get-UtcCutoff([int]$DaysAgo) {
@@ -2134,8 +2168,8 @@ function Rule_WRK785_ItemsAreNotPlannedTooFarAhead {
   $horizon = $today.AddDays($ahead * $length)
   $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter ($script:StoryTypes + @('Bug', 'Task'))) + (Get-OpenFilter)) `
     -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
-  $items = @($rows | Where-Object { (Test-IsSprint $_.Iteration) -and (ConvertTo-UtcDate ([string]$_.Iteration.StartDate)) -gt $horizon } | ForEach-Object {
-    $start = ConvertTo-UtcDate ([string]$_.Iteration.StartDate)
+  $items = @($rows | Where-Object { (Test-IsSprint $_.Iteration) -and (ConvertTo-IterationDay $_.Iteration.StartDate) -gt $horizon } | ForEach-Object {
+    $start = ConvertTo-IterationDay $_.Iteration.StartDate
     New-WorkItemRow $Project $_ ("In {0} starting {1}, {2} days out" -f $_.Iteration.IterationPath, $start.ToString('yyyy-MM-dd'), [int]($start - $today).TotalDays)
   })
   $window = Format-Count $ahead 'sprint'
@@ -2295,6 +2329,1354 @@ function Rule_WRK900_NoStaleOpenItems {
   $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "Untouched since $(([datetime]$_.ChangedDate).ToString('yyyy-MM-dd'))" })
   Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open items untouched for over $days days" `
     -Singular "open item untouched for over $days days" -Plural "open items untouched for over $days days" -Detail (Get-TypeCounts $items)
+}
+
+
+#######################################################################################################################################################################
+#                       RULES added November 2026: users, extensions, process, dashboards, readiness, ordering, task flow, sprint boundaries                       #
+#######################################################################################################################################################################
+
+# ---- Shared helpers for the rules below
+
+function Get-AnalyticsEntity {
+  # Reads any Analytics entity set for one project (WorkItemRevisions, Iterations, ...), the
+  # way Get-AnalyticsWorkItems reads WorkItems. Filter is appended to the project filter.
+  param([Parameter(Mandatory = $true)]$Project, [Parameter(Mandatory = $true)][string]$Entity, [string]$Filter, [string]$Select, [string]$Expand)
+  $f = "Project/ProjectName eq '$(ConvertTo-ODataString $Project.name)'"
+  if ($Filter) { $f += " and ($Filter)" }
+  $uri = $script:AnalyticsBase + "_odata/$($script:AnalyticsApiVersion)/$($Entity)?`$filter=$f"
+  if ($Select) { $uri += "&`$select=$Select" }
+  if ($Expand) { $uri += "&`$expand=$Expand" }
+  $rows = Invoke-AdoGet -Uri $uri -AllPages
+  return ,@($rows)
+}
+
+function Get-WorkItemRevisionRows {
+  # Every revision of the given work items from Analytics, 150 IDs per request. Filter is an
+  # optional extra condition on the revisions.
+  param([Parameter(Mandatory = $true)]$Project, [int[]]$Ids, [string]$Select, [string]$Filter = '', [string]$Expand = '')
+  $out = New-Object System.Collections.Generic.List[object]
+  $unique = @($Ids | Where-Object { $_ } | Select-Object -Unique)
+  for ($i = 0; $i -lt $unique.Count; $i += 150) {
+    $batch = $unique[$i..([Math]::Min($i + 149, $unique.Count - 1))]
+    $f = "WorkItemId in ($($batch -join ','))"
+    if ($Filter) { $f += " and $Filter" }
+    foreach ($r in (Get-AnalyticsEntity -Project $Project -Entity 'WorkItemRevisions' -Filter $f -Select $Select -Expand $Expand)) { $out.Add($r) }
+  }
+  return ,$out.ToArray()
+}
+
+function Get-WorkingDaysSince($Value) {
+  # Weekdays after the day of Value up to and including today (UTC): an item changed
+  # yesterday is one working day old, one changed on Friday is one working day old on Monday.
+  $instant = ConvertTo-UtcInstant $Value
+  if ($null -eq $instant) { return 0 }
+  $today = (Get-Date).ToUniversalTime().Date
+  $n = 0
+  for ($d = $instant.Date.AddDays(1); $d -le $today; $d = $d.AddDays(1)) {
+    if ($d.DayOfWeek -ne [DayOfWeek]::Saturday -and $d.DayOfWeek -ne [DayOfWeek]::Sunday) { $n++ }
+  }
+  return $n
+}
+
+function Format-Day($Value) {
+  # yyyy-MM-dd for a date from a JSON payload, in UTC.
+  $instant = ConvertTo-UtcInstant $Value
+  if ($null -eq $instant) { return "" }
+  return $instant.ToString('yyyy-MM-dd')
+}
+
+function Get-PlainText([string]$Html) {
+  # The text of an HTML field: line breaks for block ends, tags dropped, entities decoded.
+  if ([string]::IsNullOrWhiteSpace($Html)) { return "" }
+  $t = $Html -replace '(?i)<br\s*/?>', "`n" -replace '(?i)</(p|div|li|h\d|tr)>', "`n" -replace '<[^>]+>', ''
+  return ([System.Net.WebUtility]::HtmlDecode($t)).Trim()
+}
+
+function Get-TextFieldValues($Project, $Rows, [string[]]$Fields) {
+  # The named text fields of the given Analytics rows, through the work items REST API (HTML
+  # fields are not in Analytics). Only fields some type in play has are requested, since a
+  # field unknown to the project is a 400. Returns Values (ID -> fields) and OnType (type ->
+  # field reference names) so a caller can tell "empty" from "not on this type".
+  $rows = @($Rows)
+  $types = @($rows | ForEach-Object { [string]$_.WorkItemType } | Select-Object -Unique)
+  $onType = @{}
+  foreach ($ty in $types) { $onType[$ty] = @(Get-WorkItemTypeFieldNames $Project $ty) }
+  $request = @($Fields | Where-Object { $ref = $_; @($types | Where-Object { $onType[$_].Count -eq 0 -or $onType[$_] -contains $ref }).Count -gt 0 })
+  $values = @{}
+  if ($rows.Count -gt 0 -and $request.Count -gt 0) { $values = Get-WorkItemFields -Ids @($rows | ForEach-Object { [int]$_.WorkItemId }) -Fields $request }
+  return @{ Values = $values; OnType = $onType }
+}
+
+function Test-TypeHasField($Text, [string]$Type, [string]$Ref) {
+  # True when the type carries the field, or when its field list could not be read.
+  $have = $Text.OnType[$Type]
+  return (-not $have -or $have.Count -eq 0 -or $have -contains $Ref)
+}
+
+function Get-FieldText($Text, $Row, [string]$Ref) {
+  $f = $Text.Values[[int]$Row.WorkItemId]
+  if (-not $f) { return "" }
+  return [string]$f.$Ref
+}
+
+function Get-ReadyState { return [string](Get-Setting 'ReadyState' 'Ready') }
+
+function Get-ValueClausePattern { return [string](Get-Setting 'ValueClausePattern' '(?i)\bso\s+that\b') }
+
+function Test-NameInList($List, [string[]]$Names) {
+  # True when any of the names (display name, email, principal name) is in the list, ignoring case.
+  foreach ($l in @($List)) { foreach ($n in $Names) { if ($n -and $n -ieq $l) { return $true } } }
+  return $false
+}
+
+function Get-UserEntitlements {
+  # Every user in the organization with access level and last access, from the Member
+  # Entitlement Management API (needs Member Entitlement Management, Read). Cached per run.
+  # The service pages with a continuation token in the body and names the list "items".
+  if ($null -ne $script:EntitlementCache) { return ,$script:EntitlementCache }
+  $out = New-Object System.Collections.Generic.List[object]
+  $token = $null
+  $guard = 0
+  do {
+    $guard++
+    if ($guard -gt 200) { throw "Paging guard tripped reading user entitlements" }
+    $uri = $script:EntitlementBase + "_apis/userentitlements?api-version=$($script:ApiVersion)"
+    if ($token) { $uri += "&continuationToken=" + [uri]::EscapeDataString($token) }
+    $page = Invoke-AdoGet -Uri $uri
+    $rows = if ($null -ne $page.PSObject.Properties['items']) { @($page.items) } elseif ($null -ne $page.PSObject.Properties['members']) { @($page.members) } else { @($page.value) }
+    foreach ($r in $rows) { if ($r) { $out.Add($r) } }
+    $token = if ($null -ne $page.PSObject.Properties['continuationToken'] -and $page.continuationToken) { [string]$page.continuationToken } else { $null }
+  } while ($token)
+  $script:EntitlementCache = $out.ToArray()
+  return ,$script:EntitlementCache
+}
+
+function Get-EntitlementNames($Entitlement) {
+  $u = $Entitlement.user
+  return @([string]$u.displayName, [string]$u.mailAddress, [string]$u.principalName)
+}
+
+function Test-PaidEntitlement($Entitlement) {
+  # True for an access level the organization pays for: Basic or Basic + Test Plans bought
+  # through the organization. Stakeholder is free, and a Visual Studio subscription is paid
+  # for elsewhere.
+  $a = $Entitlement.accessLevel
+  if (-not $a) { return $false }
+  if ([string]$a.licensingSource -ine 'account') { return $false }
+  return ([string]$a.accountLicenseType -notin @('stakeholder', 'none', ''))
+}
+
+function Get-LastAccess($Entitlement) {
+  # Last access as a UTC DateTime, or $null for an account that has never signed in.
+  $instant = ConvertTo-UtcInstant $Entitlement.lastAccessedDate
+  if ($null -eq $instant -or $instant.Year -lt 2000) { return $null }
+  return $instant
+}
+
+function Get-ProjectProcessId($Project) {
+  # The typeId of the process the project is on, cached per project.
+  $key = [string]$Project.id
+  if (-not $script:ProcessIdCache) { $script:ProcessIdCache = @{} }
+  if (-not $script:ProcessIdCache.ContainsKey($key)) {
+    $detail = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/projects/$($Project.id)?includeCapabilities=true&api-version=$($script:ApiVersion)")
+    $script:ProcessIdCache[$key] = [string]$detail.capabilities.processTemplate.templateTypeId
+  }
+  return $script:ProcessIdCache[$key]
+}
+
+function Get-ProcessWorkItemTypes($Project) {
+  # The work item types of the project's process (name, referenceName, isDisabled), cached.
+  $pid_ = Get-ProjectProcessId $Project
+  if (-not $script:ProcessTypeCache) { $script:ProcessTypeCache = @{} }
+  if (-not $script:ProcessTypeCache.ContainsKey($pid_)) {
+    $script:ProcessTypeCache[$pid_] = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/work/processes/$pid_/workitemtypes?api-version=$($script:ApiVersion)") -AllPages
+  }
+  return ,$script:ProcessTypeCache[$pid_]
+}
+
+function Get-ProjectTypeStates($Project, [string]$Type) {
+  # The states a work item type has in the project (name, category), hidden states left out;
+  # $null when the project has no such type. Cached per project and type.
+  $key = "$($Project.id)|$Type"
+  if (-not $script:TypeStateCache) { $script:TypeStateCache = @{} }
+  if (-not $script:TypeStateCache.ContainsKey($key)) {
+    $states = $null
+    try {
+      $states = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/wit/workitemtypes/$([uri]::EscapeDataString($Type))/states?api-version=$($script:ApiVersion)") -AllPages
+    } catch {
+      if ($_.Exception.Message -notlike 'HTTP 404*') { throw }
+    }
+    $script:TypeStateCache[$key] = $states
+  }
+  return $script:TypeStateCache[$key]
+}
+
+function Get-TeamBacklogs($Project) {
+  # Each team with the areas its backlog shows (teamfieldvalues) and whether its backlog
+  # items level is switched on (teamsettings backlogVisibilities). Cached per project.
+  $key = [string]$Project.id
+  if (-not $script:TeamBacklogCache) { $script:TeamBacklogCache = @{} }
+  if (-not $script:TeamBacklogCache.ContainsKey($key)) {
+    $list = @(foreach ($team in (Get-AdoTeams $Project)) {
+      $tfv = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/$($team.id)/_apis/work/teamsettings/teamfieldvalues?api-version=$($script:ApiVersion)")
+      $ts  = Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/$($team.id)/_apis/work/teamsettings?api-version=$($script:ApiVersion)")
+      $requirements = $true
+      $vis = $ts.backlogVisibilities
+      if ($vis -and $null -ne $vis.PSObject.Properties['Microsoft.RequirementCategory']) { $requirements = [bool]$vis.'Microsoft.RequirementCategory' }
+      [pscustomobject]@{
+        Team         = [string]$team.name
+        Areas        = @($tfv.values | ForEach-Object { [pscustomobject]@{ Path = [string]$_.value; Children = [bool]$_.includeChildren } })
+        Requirements = $requirements
+      }
+    })
+    $script:TeamBacklogCache[$key] = $list
+  }
+  return ,$script:TeamBacklogCache[$key]
+}
+
+function Test-InTeamAreas($Areas, [string]$Path) {
+  foreach ($a in @($Areas)) {
+    if ($Path -ieq $a.Path) { return $true }
+    if ($a.Children -and $Path.StartsWith("$($a.Path)\", [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+function Get-TeamBacklogOrders($Project) {
+  # For every team whose backlog items level is on: its open Stories (and Bugs when they
+  # are requirements) in backlog order, Backlog Priority ascending, unranked items last.
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter (Get-RequirementTypes)) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State,StateCategory,BacklogPriority" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $orders = @(foreach ($t in (Get-TeamBacklogs $Project)) {
+    if (-not $t.Requirements) { continue }
+    $mine = @($rows | Where-Object { $_.Area -and (Test-InTeamAreas $t.Areas ([string]$_.Area.AreaPath)) } |
+      Sort-Object @{ Expression = { if ($null -eq $_.BacklogPriority) { [double]::MaxValue } else { [double]$_.BacklogPriority } } }, WorkItemId)
+    if ($mine.Count -gt 0) { [pscustomobject]@{ Team = $t.Team; Items = $mine } }
+  })
+  return ,$orders
+}
+
+function Get-OutOfOrderIndexes([double[]]$Keys) {
+  # Indexes of the items outside one longest non-decreasing run of Keys: the fewest items
+  # that would have to move for the list to be in order (patience sorting, n log n).
+  $n = $Keys.Count
+  if ($n -eq 0) { return @() }
+  $tails = New-Object System.Collections.Generic.List[int]
+  $prev = New-Object int[] $n
+  for ($i = 0; $i -lt $n; $i++) {
+    $lo = 0; $hi = $tails.Count
+    while ($lo -lt $hi) {
+      $mid = [int][Math]::Floor(($lo + $hi) / 2)
+      if ($Keys[$tails[$mid]] -le $Keys[$i]) { $lo = $mid + 1 } else { $hi = $mid }
+    }
+    $prev[$i] = if ($lo -gt 0) { $tails[$lo - 1] } else { -1 }
+    if ($lo -eq $tails.Count) { $tails.Add($i) } else { $tails[$lo] = $i }
+  }
+  $keep = @{}
+  $k = $tails[$tails.Count - 1]
+  while ($k -ge 0) { $keep[$k] = $true; $k = $prev[$k] }
+  return @(for ($i = 0; $i -lt $n; $i++) { if (-not $keep.ContainsKey($i)) { $i } })
+}
+
+function Get-SprintCalendar($Project) {
+  # Dated sprints from the iteration tree (see Get-DatedSprints), sorted by start, with the
+  # Analytics iteration path ("Project\Sprint 143") alongside the tree path.
+  $root = [string]$Project.name
+  return @(Get-DatedSprints $Project | Sort-Object Start | ForEach-Object {
+    $path = [string]$_.Row.Path
+    $cut = $path.LastIndexOf('\')
+    $parent = if ($cut -ge 0) { $path.Substring(0, $cut) } else { "" }   # not Split-Path: on Linux it does not split on a backslash
+    [pscustomobject]@{ Path = "$root\$path"; Name = [string]$_.Row.Node.name; Parent = $parent; Start = $_.Start; End = $_.End }
+  })
+}
+
+function Get-PreviousSprint($Calendar, $Sprint) {
+  # The sprint that ended last before this one started, preferring a sibling in the same
+  # branch of the tree (per-team sprint trees), else any.
+  $before = @($Calendar | Where-Object { $_.End -lt $Sprint.Start } | Sort-Object End)
+  $siblings = @($before | Where-Object { $_.Parent -eq $Sprint.Parent })
+  if ($siblings.Count -gt 0) { return $siblings[-1] }
+  if ($before.Count -gt 0) { return $before[-1] }
+  return $null
+}
+
+function Get-IterationSK($Project, [string]$Path) {
+  $r = Get-AnalyticsEntity -Project $Project -Entity 'Iterations' -Filter "IterationPath eq '$(ConvertTo-ODataString $Path)'" -Select 'IterationSK,IterationPath'
+  if (@($r).Count -eq 0) { return $null }
+  return [string]$r[0].IterationSK
+}
+
+function Get-TitleStem([string]$Title) {
+  # A title reduced to its words, lower case, with split and continuation markers removed,
+  # so "Rollout (part 2)" and "Rollout - continued" both become "rollout".
+  $t = $Title.ToLowerInvariant()
+  $t = $t -replace '\b(part|pt|phase|step|stage|round|wave|batch)\s*#?\d+\b', ' '
+  $t = $t -replace '\b(continued|cont|split|remainder|remaining|carry\s*over|carryover|follow[\s-]*up)\b\.?', ' '
+  $t = $t -replace '\(\s*\d+\s*\)', ' ' -replace '[^a-z0-9]+', ' '
+  $t = $t -replace '\s\d+\s*$', ' '
+  return ($t -replace '\s+', ' ').Trim()
+}
+
+
+# ---- Organization: users and licences (CFG02x), extensions (CFG060)
+
+function Rule_CFG026_PaidAccessLevelsAreInUse {
+  # Every account the organization pays for (Basic or Basic + Test Plans bought through the
+  # organization) has signed in within LicenseIdleDays (setting, 90); a paid seat nobody uses
+  # is a cost with no board behind it. Visual Studio subscribers and Stakeholders are free
+  # here and are left out. Organization level, so it runs once.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  if (-not (Test-FirstTarget $Project)) { return }
+  $days = [int](Get-Setting 'LicenseIdleDays' 90)
+  $cutoff = (Get-Date).ToUniversalTime().AddDays(-$days)
+  $all = Get-UserEntitlements
+  $paid = @($all | Where-Object { Test-PaidEntitlement $_ })
+  $items = @(foreach ($e in $paid) {
+    $last = Get-LastAccess $e
+    $level = [string]$e.accessLevel.licenseDisplayName
+    if ($null -eq $last) { New-NamedItem 'User' ([string]$e.user.displayName) "$level, never signed in" }
+    elseif ($last -lt $cutoff) { New-NamedItem 'User' ([string]$e.user.displayName) ("{0}, last access {1}, {2} days ago" -f $level, $last.ToString('yyyy-MM-dd'), [int]((Get-Date).ToUniversalTime() - $last).TotalDays) }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every paid account signed in within $days days ($($paid.Count) checked)" `
+    -Singular "paid account unused for over $days days" -Plural "paid accounts unused for over $days days"
+}
+
+function Rule_CFG027_TestPlansLicensesAreLimitedToTheListedAuthors {
+  # Only the accounts in TestPlansUsers (setting; names or emails) hold the Basic + Test
+  # Plans access level, so a lapsed trial or a one-off grant is not still being billed.
+  # Organization level, so it runs once.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  if (-not (Test-FirstTarget $Project)) { return }
+  $allowed = @(Get-SettingList 'TestPlansUsers' @())
+  $all = Get-UserEntitlements
+  $holders = @($all | Where-Object { [string]$_.accessLevel.accountLicenseType -ieq 'advanced' -and [string]$_.accessLevel.licensingSource -ieq 'account' })
+  if ($allowed.Count -eq 0) {
+    $names = ($holders | ForEach-Object { [string]$_.user.displayName } | Sort-Object) -join ', '
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No TestPlansUsers setting; $(Format-Count $holders.Count 'account holds' 'accounts hold') Basic + Test Plans: $names." -Note "No TestPlansUsers setting; $(Format-Count $holders.Count 'holder')"
+    return
+  }
+  $items = @($holders | Where-Object { -not (Test-NameInList $allowed (Get-EntitlementNames $_)) } |
+    ForEach-Object { New-NamedItem 'User' ([string]$_.user.displayName) "Holds Basic + Test Plans; not in TestPlansUsers" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Basic + Test Plans is held only by the listed accounts ($($holders.Count) holders)" `
+    -Singular "account outside TestPlansUsers holds Basic + Test Plans" -Plural "accounts outside TestPlansUsers hold Basic + Test Plans"
+}
+
+function Rule_CFG029_TestAccountsHoldNoPaidAccess {
+  # The test and demo accounts in TestAccounts (setting; names or emails) hold Stakeholder
+  # access or none, so an account made for a demo is not a paid seat. Organization level.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  if (-not (Test-FirstTarget $Project)) { return }
+  $listed = @(Get-SettingList 'TestAccounts' @())
+  if ($listed.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No TestAccounts setting; nothing checked." -Note "No TestAccounts setting"
+    return
+  }
+  $all = Get-UserEntitlements
+  $found = @($all | Where-Object { Test-NameInList $listed (Get-EntitlementNames $_) })
+  $items = @($found | Where-Object { Test-PaidEntitlement $_ } |
+    ForEach-Object { New-NamedItem 'User' ("{0} ({1})" -f $_.user.displayName, $_.user.mailAddress) "Test account with $($_.accessLevel.licenseDisplayName)" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No listed test account holds paid access ($($found.Count) of $($listed.Count) present)" `
+    -Singular "test account holds paid access" -Plural "test accounts hold paid access"
+}
+
+function Rule_CFG060_InstalledExtensionsMatchTheAgreedList {
+  # The organization's installed extensions are exactly ExpectedExtensions (setting; names
+  # such as "Split!" or publisher.extension ids). An extension that was dropped is flagged
+  # until it is uninstalled, and a missing one until it is installed. Built-in extensions
+  # are left out. Needs Extensions (Read). Organization level, so it runs once.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  if (-not (Test-FirstTarget $Project)) { return }
+  $rows = Invoke-AdoGet -Uri ($script:ExtMgmtBase + "_apis/extensionmanagement/installedextensions?api-version=$($script:ApiVersion)-preview.1") -AllPages
+  $installed = @($rows | Where-Object { [string]$_.flags -notmatch 'builtIn' })
+  $expected = @(Get-SettingList 'ExpectedExtensions' @())
+  $label = { param($x) "{0} ({1}.{2})" -f $x.extensionName, $x.publisherId, $x.extensionId }
+  if ($expected.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass `
+      -Description "No ExpectedExtensions setting; installed: $(($installed | ForEach-Object { & $label $_ }) -join ', ')." -Note "No ExpectedExtensions setting; $(Format-Count $installed.Count 'extension') installed"
+    return
+  }
+  $matches_ = { param($x, $name) ([string]$x.extensionName -ieq $name) -or ("$($x.publisherId).$($x.extensionId)" -ieq $name) }
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($x in $installed) {
+    if (-not ($expected | Where-Object { & $matches_ $x $_ })) {
+      $state = if ([string]$x.installState.flags -match 'disabled') { ", disabled" } else { "" }
+      $items.Add((New-NamedItem 'Extension' (& $label $x) "Installed$state but not in ExpectedExtensions"))
+    }
+  }
+  foreach ($name in $expected) {
+    if (-not ($installed | Where-Object { & $matches_ $_ $name })) { $items.Add((New-NamedItem 'Extension' $name "In ExpectedExtensions but not installed")) }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Installed extensions match the agreed list ($($installed.Count) installed)" `
+    -Singular "extension differs from the agreed list" -Plural "extensions differ from the agreed list" -Detail (($items | ForEach-Object { "$($_.Title): $($_.Problem)" }) -join '; ')
+}
+
+
+# ---- Process: work item types, states and fields (CFG2xx)
+
+function Rule_CFG225_WorkItemTypesHaveTheAgreedStates {
+  # Each work item type named in ExpectedStates (setting, an object: "Product Backlog Item":
+  # "New, Ready, In Progress, Done, Removed") has exactly those states in the project, so a
+  # rename leaves no Approved or Committed behind and nothing extra crept in.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $expected = Get-Setting 'ExpectedStates'
+  if ($null -eq $expected -or ($expected -isnot [string] -and @($expected.PSObject.Properties).Count -eq 0)) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No ExpectedStates setting; nothing checked." -Note "No ExpectedStates setting"
+    return
+  }
+  if ($expected -is [string]) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusError -Description "ExpectedStates must be an object of type name to comma-separated states." -Note "ExpectedStates is not an object"
+    return
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  $checked = 0
+  foreach ($prop in $expected.PSObject.Properties) {
+    $type = [string]$prop.Name
+    $want = @(([string]$prop.Value) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $have = Get-ProjectTypeStates $Project $type
+    if ($null -eq $have) { $items.Add((New-NamedItem 'Work item type' $type "Not a work item type in $($Project.name)")); continue }
+    $checked++
+    $names = @($have | ForEach-Object { [string]$_.name })
+    $extra = @($names | Where-Object { $n = $_; -not ($want | Where-Object { $_ -ieq $n }) })
+    $missing = @($want | Where-Object { $w = $_; -not ($names | Where-Object { $_ -ieq $w }) })
+    $parts = @()
+    if ($extra.Count -gt 0) { $parts += "has $($extra -join ', ') beyond the agreed states" }
+    if ($missing.Count -gt 0) { $parts += "lacks $($missing -join ', ')" }
+    if ($parts.Count -gt 0) { $items.Add((New-NamedItem 'Work item type' $type (($parts -join '; ') + " (states: $($names -join ', '))"))) }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every listed type has exactly the agreed states ($checked checked)" `
+    -Singular "type differs from its agreed states" -Plural "types differ from their agreed states" -Detail (($items | ForEach-Object { $_.Title }) -join ', ')
+}
+
+function Rule_CFG226_NoItemsSitInAHiddenState {
+  # No work item, Closed and Removed included, is in a state its type no longer shows:
+  # hiding or removing a state in the process does not move the items in it, so they drop
+  # off every board column and out of every state-based query. Counts come from an
+  # Analytics group-by; the states from the project's work item types.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $uri = $script:AnalyticsBase + "_odata/$($script:AnalyticsApiVersion)/WorkItems?`$apply=filter(Project/ProjectName eq '$(ConvertTo-ODataString $Project.name)')/groupby((WorkItemType,State),aggregate(`$count as Count))"
+  $groups = Invoke-AdoGet -Uri $uri -AllPages
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($g in ($groups | Sort-Object WorkItemType, State)) {
+    $states = Get-ProjectTypeStates $Project ([string]$g.WorkItemType)
+    if ($null -eq $states) { $items.Add((New-NamedItem 'State' "$($g.WorkItemType): $($g.State)" "$($g.Count) items on a type the project no longer has")); continue }
+    if (-not (@($states) | Where-Object { [string]$_.name -ieq [string]$g.State })) {
+      $items.Add((New-NamedItem 'State' "$($g.WorkItemType): $($g.State)" "$($g.Count) items in a state $($g.WorkItemType) no longer has"))
+    }
+  }
+  $total = ($groups | Measure-Object -Property Count -Sum).Sum
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every item is in a state its type has ($total items, $($groups.Count) type and state pairs)" `
+    -Singular "type and state pair holds items in a hidden state" -Plural "type and state pairs hold items in a hidden state" -Detail (($items | ForEach-Object { "$($_.Title) ($($_.Problem -replace ' items.*$', ''))" }) -join ', ')
+}
+
+function Get-RetiredTypeNames($Project, [switch]$DisabledOnly) {
+  # Types disabled in the project's process, plus the RetiredTypes setting unless DisabledOnly.
+  $types = Get-ProcessWorkItemTypes $Project
+  $names = @($types | Where-Object { $_.isDisabled } | ForEach-Object { [string]$_.name })
+  if (-not $DisabledOnly) { $names += @(Get-SettingList 'RetiredTypes' @()) }
+  return @($names | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Rule_CFG230_RetiredWorkItemTypesHaveNoOpenItems {
+  # Nothing open remains on a type that is disabled in the process or listed in RetiredTypes
+  # (setting); the work moved to the type that replaced it.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $types = @(Get-RetiredTypeNames $Project)
+  if ($types.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No disabled or retired work item types." -Note "No disabled or retired types"
+    return
+  }
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $types) + (Get-OpenFilter)) -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "Open on the retired $($_.WorkItemType) type" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open items on $($types -join ', ')" `
+    -Singular "open item is on a retired type" -Plural "open items are on a retired type" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_CFG232_DisabledWorkItemTypesHoldNoItems {
+  # No work item of any state, Closed and Removed included, sits on a type disabled in the
+  # process (Bug switched off, say): the type is gone from the New menu but its items are
+  # still in queries, Analytics and history, and nobody can create the replacement links.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $types = @(Get-RetiredTypeNames $Project -DisabledOnly)
+  if ($types.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No work item types are disabled in the process." -Note "No disabled types"
+    return
+  }
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter (New-TypeFilter $types) -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "$($_.State) on the disabled $($_.WorkItemType) type" })
+  $byState = (@($rows) | Group-Object State | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No items on the disabled $($types -join ', ') type" `
+    -Singular "item is on a disabled type" -Plural "items are on a disabled type" -Detail "$($types -join ', '); $byState"
+}
+
+function Rule_CFG247_PicklistFieldsDoNotAllowCustomValues {
+  # Every field in PicklistFields (setting; reference names such as Custom.Category, or
+  # names) is a picklist with "allow users to set their own values" off, so a category stays
+  # a category and does not turn into free text. Fields are organization level, so it runs once.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  if (-not (Test-FirstTarget $Project)) { return }
+  $fields = @(Get-SettingList 'PicklistFields' @())
+  if ($fields.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No PicklistFields setting; nothing checked." -Note "No PicklistFields setting"
+    return
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($name in $fields) {
+    $f = $null
+    try { $f = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/wit/fields/$([uri]::EscapeDataString($name))?api-version=$($script:ApiVersion)") }
+    catch { if ($_.Exception.Message -like 'HTTP 404*') { $items.Add((New-NamedItem 'Field' $name "No such field")); continue } else { throw } }
+    if (-not $f.isPicklist -or -not $f.picklistId) { $items.Add((New-NamedItem 'Field' "$($f.name) ($($f.referenceName))" "Not a picklist")); continue }
+    $list = Invoke-AdoGet -Uri ($script:CoreBase + "_apis/work/processes/lists/$($f.picklistId)?api-version=$($script:ApiVersion)")
+    if ($list.isSuggested) { $items.Add((New-NamedItem 'Field' "$($f.name) ($($f.referenceName))" "Allows users to set their own values (values: $(@($list.items) -join ', '))")) }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every listed picklist accepts only its own values ($($fields.Count) checked)" `
+    -Singular "picklist field accepts custom values or is not a picklist" -Plural "picklist fields accept custom values or are not picklists" -Detail (($items | ForEach-Object { $_.Title }) -join ', ')
+}
+
+function Rule_CFG248_RetiredFieldsAreReadOnly {
+  # Every field in RetiredFields (setting; reference names, migration leftovers such as
+  # Custom.LegacyId) is read-only wherever it sits on a type of the project's process: the
+  # field is read-only on the type, or an enabled rule makes it read-only (for everyone
+  # outside an administrators group, say). The data that came over stays; nobody adds to it.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $retired = @(Get-SettingList 'RetiredFields' @())
+  if ($retired.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No RetiredFields setting; nothing checked." -Note "No RetiredFields setting"
+    return
+  }
+  $pid_ = Get-ProjectProcessId $Project
+  $items = New-Object System.Collections.Generic.List[object]
+  $placements = 0
+  $types = Get-ProcessWorkItemTypes $Project
+  foreach ($t in @($types | Where-Object { -not $_.isDisabled })) {
+    $base = $script:CoreBase + "_apis/work/processes/$pid_/workItemTypes/$([uri]::EscapeDataString([string]$t.referenceName))"
+    $fields = Invoke-AdoGet -Uri "$base/fields?api-version=$($script:ApiVersion)" -AllPages
+    $onType = @($fields | Where-Object { $r = [string]$_.referenceName; $retired | Where-Object { $_ -ieq $r } })
+    if ($onType.Count -eq 0) { continue }
+    $allRules = Invoke-AdoGet -Uri "$base/rules?api-version=$($script:ApiVersion)" -AllPages
+    $rules = @($allRules | Where-Object { -not $_.isDisabled })
+    foreach ($f in $onType) {
+      $placements++
+      $ref = [string]$f.referenceName
+      if ($f.readOnly) { continue }
+      $ruled = @($rules | Where-Object { @($_.actions | Where-Object { [string]$_.actionType -eq 'makeReadOnly' -and [string]$_.targetField -ieq $ref }).Count -gt 0 })
+      if ($ruled.Count -eq 0) { $items.Add((New-NamedItem 'Field' "$ref on $($t.name)" "Editable: not read-only on the type and no enabled read-only rule")) }
+    }
+  }
+  if ($placements -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "None of the RetiredFields is on a type of this process." -Note "No retired field on any type"
+    return
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every retired field is read-only ($placements placements checked)" `
+    -Singular "retired field is still editable on a type" -Plural "retired fields are still editable on a type" -Detail (($items | ForEach-Object { $_.Title }) -join ', ')
+}
+
+
+# ---- Dashboards (CFG386)
+
+function Get-QueryPath($Project, [string]$Id) {
+  # The path of a saved query ("Shared Queries/..." or "My Queries/..."), or $null when the
+  # PAT cannot read it: someone else's My Queries, or deleted. Cached.
+  $key = "$($Project.id)|$Id"
+  if (-not $script:QueryPathCache) { $script:QueryPathCache = @{} }
+  if (-not $script:QueryPathCache.ContainsKey($key)) {
+    $path = $null
+    try { $path = [string](Invoke-AdoGet -Uri ($script:CoreBase + "$($Project.id)/_apis/wit/queries/$($Id)?api-version=$($script:ApiVersion)")).path }
+    catch { if ($_.Exception.Message -notlike 'HTTP 404*') { throw } }
+    $script:QueryPathCache[$key] = $path
+  }
+  return $script:QueryPathCache[$key]
+}
+
+function Rule_CFG386_DashboardWidgetsUseSharedQueries {
+  # No widget on a team or project dashboard reads a query from someone's My Queries: the
+  # widget shows nothing to anyone else, so the dashboard looks broken. A query the PAT owner
+  # cannot read is someone else's private query, or deleted; one under "My Queries" is the
+  # PAT owner's own. Needs Team dashboards (Read).
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $teams = @{}
+  foreach ($t in (Get-AdoTeams $Project)) { $teams[[string]$t.id] = [string]$t.name }
+  $projectPath = [uri]::EscapeDataString([string]$Project.name)
+  $boards = Invoke-AdoGet -Uri ($script:CoreBase + "$projectPath/_apis/dashboard/dashboards?api-version=$($script:ApiVersion)-preview.3") -AllPages
+  $items = New-Object System.Collections.Generic.List[object]
+  $widgets = 0
+  foreach ($d in $boards) {
+    $owner = [string]$d.ownerId
+    $isTeam = $teams.ContainsKey($owner)
+    $scope = if ($isTeam) { "$projectPath/$owner" } else { $projectPath }
+    $full = Invoke-AdoGet -Uri ($script:CoreBase + "$scope/_apis/dashboard/dashboards/$($d.id)?api-version=$($script:ApiVersion)-preview.3")
+    $where = if ($isTeam) { "$($teams[$owner]) / $($d.name)" } else { "Project / $($d.name)" }
+    $url = $script:CoreBase + [uri]::EscapeDataString([string]$Project.name) + "/_dashboards/dashboard/$($d.id)"
+    foreach ($w in @($full.widgets)) {
+      $settings = [string]$w.settings
+      $ids = @([regex]::Matches($settings, '(?i)"queryId"\s*:\s*"([0-9a-f-]{36})"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+      foreach ($qid in $ids) {
+        $widgets++
+        $path = Get-QueryPath $Project $qid
+        if ($null -eq $path) { $items.Add((New-NamedItem 'Widget' "$where / $($w.name)" "Query $qid cannot be read: someone's My Queries, or deleted" $url)) }
+        elseif ($path -like 'My Queries*') { $items.Add((New-NamedItem 'Widget' "$where / $($w.name)" "Query is in My Queries ($path)" $url)) }
+      }
+    }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every query widget reads a shared query ($widgets widgets on $($boards.Count) dashboards)" `
+    -Singular "dashboard widget reads a private or missing query" -Plural "dashboard widgets read private or missing queries" `
+    -Detail ((($items | Group-Object { ($_.Title -split ' / ')[0..1] -join ' / ' } | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '))
+}
+
+
+# ---- Rollup: parents with a finished child are started (WRK135, WRK235, WRK335)
+
+function Test-FinishedChildRule {
+  # A parent of the given type(s) still in the Proposed category (New, or Ready where the
+  # process has it) while a child is already Completed: the work started, whatever the parent
+  # says. The finished-child counterpart of Test-ActiveChildRule, which counts only children
+  # in progress. A parent whose children are all closed is left to WRK120, WRK220 and WRK320.
+  param($Project, [string]$RuleCode, [string[]]$ParentTypes, [string]$ParentSingular, [string]$ParentPlural)
+  $pairs = Get-ParentChildPairs -Project $Project
+  $byParent = @{}
+  foreach ($c in $pairs.Children) {
+    $k = [int]$c.ParentWorkItemId
+    if (-not $byParent.ContainsKey($k)) { $byParent[$k] = New-Object System.Collections.Generic.List[object] }
+    $byParent[$k].Add($c)
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($k in $byParent.Keys) {
+    $p = $pairs.Parents[$k]
+    if ($null -eq $p -or $ParentTypes -notcontains [string]$p.WorkItemType -or $p.StateCategory -ne 'Proposed') { continue }
+    $kids = $byParent[$k].ToArray()
+    $done = @($kids | Where-Object { $_.StateCategory -eq 'Completed' } | Sort-Object WorkItemId)
+    if ($done.Count -eq 0 -or $done.Count -eq $kids.Count) { continue }
+    $items.Add((New-ParentItem $Project $p ("{0} while {1} of {2} children are done ({3} {4} is {5})" -f $p.State, $done.Count, $kids.Count, $done[0].WorkItemType, $done[0].WorkItemId, $done[0].State)))
+  }
+  Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "No unstarted $ParentPlural have a finished child" `
+    -Singular "unstarted $ParentSingular has a finished child" -Plural "unstarted $ParentPlural have a finished child"
+}
+
+function Rule_WRK135_EpicsWithAFinishedChildAreStarted    { param($Project); Test-FinishedChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Epic' -ParentSingular 'Epic' -ParentPlural 'Epics' }
+function Rule_WRK235_FeaturesWithAFinishedChildAreStarted { param($Project); Test-FinishedChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes 'Feature' -ParentSingular 'Feature' -ParentPlural 'Features' }
+function Rule_WRK335_StoriesWithAFinishedChildAreStarted  { param($Project); Test-FinishedChildRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -ParentTypes $script:StoryTypes -ParentSingular 'Story' -ParentPlural 'Stories' }
+
+
+# ---- Epics and Features: acceptance criteria and value (WRK167, WRK168, WRK268)
+
+function Rule_WRK167_EpicsHaveEnoughAcceptanceCriteria {
+  # Every open Epic with acceptance criteria lists at least AcMinItems (setting, 3) of them,
+  # counted as list bullets, or as lines when there are no bullets: one line is a hope, three
+  # describe the outcome. An Epic with none is WRK165's business.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $min = [int](Get-Setting 'AcMinItems' 3)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Epic') + (Get-OpenFilter)) -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  $ref = 'Microsoft.VSTS.Common.AcceptanceCriteria'
+  $text = Get-TextFieldValues $Project $rows @($ref)
+  $checked = 0
+  $items = @(foreach ($w in $rows) {
+    $html = Get-FieldText $text $w $ref
+    if (-not (Test-HasText $html)) { continue }
+    $checked++
+    $bullets = ([regex]::Matches($html, '(?i)<li[\s>]')).Count
+    $count = if ($bullets -gt 0) { $bullets } else { @((Get-PlainText $html) -split "`n" | Where-Object { $_.Trim() }).Count }
+    if ($count -lt $min) { New-WorkItemRow $Project $w "$(Format-Count $count 'acceptance criterion' 'acceptance criteria'), fewer than $min" }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Epic with acceptance criteria lists at least $min ($checked checked)" `
+    -Singular "open Epic lists fewer than $min acceptance criteria" -Plural "open Epics list fewer than $min acceptance criteria"
+}
+
+function Test-ValueClauseRule {
+  # Every row whose description has text states its value: the description matches
+  # ValueClausePattern (setting, default "so that"). An empty description is left to the
+  # description rules.
+  param($Project, [string]$RuleCode, $Rows, [string]$PassNote, [string]$Singular, [string]$Plural)
+  $pattern = Get-ValueClausePattern
+  $ref = 'System.Description'
+  $rows = @($Rows)
+  $text = Get-TextFieldValues $Project $rows @($ref)
+  $checked = 0
+  $items = @(foreach ($w in $rows) {
+    $plain = Get-PlainText (Get-FieldText $text $w $ref)
+    if (-not $plain) { continue }
+    $checked++
+    if ($plain -notmatch $pattern) { New-WorkItemRow $Project $w "$($w.State); the description has no value clause ($pattern)" }
+  })
+  Add-CountResult -Project $Project -RuleCode $RuleCode -Items $items -PassNote "$PassNote ($checked checked)" -Singular $Singular -Plural $Plural -Detail (Get-TypeCounts $items)
+}
+
+function Get-RefinedRows($Project, [string[]]$Types, [switch]$IncludeSprint) {
+  # Open items of the types that are in the ReadyState state or in progress, plus (with
+  # IncludeSprint) any in a sprint that has not ended: the items that should be refined.
+  $ready = Get-ReadyState
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $Types) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State,StateCategory" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  return @($rows | Where-Object {
+    ($ready -and [string]$_.State -ieq $ready) -or $_.StateCategory -in 'InProgress', 'Resolved' -or
+    ($IncludeSprint -and (Get-SprintPhase $_.Iteration) -in 'current', 'future')
+  })
+}
+
+function Rule_WRK168_RefinedEpicsHaveAValueClause {
+  # An Epic that is Ready (ReadyState setting) or in progress says who benefits and why: its
+  # description has a value clause ("so that", ValueClausePattern setting).
+  param($Project)
+  Test-ValueClauseRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows (Get-RefinedRows $Project @('Epic')) `
+    -PassNote "Every Ready or active Epic states its value" -Singular "Ready or active Epic has no value clause" -Plural "Ready or active Epics have no value clause"
+}
+
+function Rule_WRK268_RefinedFeaturesHaveAValueClause {
+  # The Feature form of WRK168.
+  param($Project)
+  Test-ValueClauseRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows (Get-RefinedRows $Project @('Feature')) `
+    -PassNote "Every Ready or active Feature states its value" -Singular "Ready or active Feature has no value clause" -Plural "Ready or active Features have no value clause"
+}
+
+
+# ---- Stories: value, shells and the Definition of Ready (WRK340 to WRK357)
+
+function Rule_WRK340_RefinedStoriesHaveAValueClause {
+  # A Story that is Ready (ReadyState setting), in progress, or in a sprint that has not
+  # ended says why it is worth doing: its description has a value clause ("so that",
+  # ValueClausePattern setting). "As a ... I want ..." with no "so that" was never refined
+  # for value.
+  param($Project)
+  Test-ValueClauseRule -Project $Project -RuleCode (Get-RuleCode $MyInvocation.MyCommand.Name) -Rows (Get-RefinedRows $Project $script:StoryTypes -IncludeSprint) `
+    -PassNote "Every refined Story states its value" -Singular "refined Story has no value clause" -Plural "refined Stories have no value clause"
+}
+
+function Rule_WRK345_OpenStoriesAreFilledInPromptly {
+  # Any open Story created more than ShellMaxDays (setting, 5) working days ago has a
+  # description and acceptance criteria, sprint or backlog: a shell is a placeholder for a
+  # few days, not a way of life. The backlog form of WRK360.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [int](Get-Setting 'ShellMaxDays' 5)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + (Get-OpenFilter) + " and CreatedDate lt $(Get-UtcCutoff $max)") `
+    -Select "WorkItemId,Title,WorkItemType,State,CreatedDate" -Expand "Area(`$select=AreaPath)"
+  $old = @($rows | Where-Object { (Get-WorkingDaysSince $_.CreatedDate) -gt $max })
+  $fields = [ordered]@{ 'System.Description' = 'description'; 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }
+  $text = Get-TextFieldValues $Project $old @($fields.Keys)
+  $items = @(foreach ($w in $old) {
+    $missing = @(foreach ($ref in $fields.Keys) { if ((Test-TypeHasField $text ([string]$w.WorkItemType) $ref) -and -not (Test-HasText (Get-FieldText $text $w $ref))) { $fields[$ref] } })
+    if ($missing.Count -gt 0) { New-WorkItemRow $Project $w ("Created {0}, {1} working days ago; no {2}" -f (Format-Day $w.CreatedDate), (Get-WorkingDaysSince $w.CreatedDate), ($missing -join ' or ')) }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every open Story older than $max working days is filled in ($($old.Count) checked)" `
+    -Singular "open Story is still a shell after $max working days" -Plural "open Stories are still shells after $max working days" -Detail (Get-TypeCounts $items)
+}
+
+function Get-ReadyStoryRows($Project, [string]$ExtraSelect = '') {
+  # Open Stories in the ReadyState state (setting, Ready), or $null when the setting is empty.
+  $ready = Get-ReadyState
+  if (-not $ready) { return $null }
+  $select = "WorkItemId,Title,WorkItemType,State,ParentWorkItemId"
+  if ($ExtraSelect) { $select += ",$ExtraSelect" }
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + " and State eq '$(ConvertTo-ODataString $ready)'") `
+    -Select $select -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  return ,$rows
+}
+
+function Add-NoReadyStateResult($Project, [string]$Code) {
+  Add-Result -Project $Project -Rule $Code -Status $script:StatusPass -Description "No ReadyState setting; nothing checked." -Note "No ReadyState setting"
+}
+
+function Rule_WRK352_ReadyStoriesMeetTheDefinitionOfReady {
+  # A Story in the ReadyState state (setting, Ready) has a description, acceptance criteria
+  # and a parent Feature: the base of every team's Definition of Ready, checked when the
+  # Story is marked Ready rather than when it lands in a sprint. WRK355 adds the estimate and
+  # WRK356 or WRK357 the Tasks.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-ReadyStoryRows $Project
+  if ($null -eq $rows) { Add-NoReadyStateResult $Project $code; return }
+  $fields = [ordered]@{ 'System.Description' = 'description'; 'Microsoft.VSTS.Common.AcceptanceCriteria' = 'acceptance criteria' }
+  $text = Get-TextFieldValues $Project $rows @($fields.Keys)
+  $withParent = @($rows | Where-Object { $_.ParentWorkItemId })
+  $parents = @{}
+  if ($withParent.Count -gt 0) { $parents = Get-WorkItemFields -Ids @($withParent | ForEach-Object { [int]$_.ParentWorkItemId }) -Fields @('System.WorkItemType') }
+  $items = @(foreach ($w in $rows) {
+    $problems = @(foreach ($ref in $fields.Keys) { if ((Test-TypeHasField $text ([string]$w.WorkItemType) $ref) -and -not (Test-HasText (Get-FieldText $text $w $ref))) { "no $($fields[$ref])" } })
+    if (-not $w.ParentWorkItemId) { $problems += "no parent Feature" }
+    else {
+      $ptype = if ($parents.ContainsKey([int]$w.ParentWorkItemId)) { [string]$parents[[int]$w.ParentWorkItemId].'System.WorkItemType' } else { 'unreadable item' }
+      if ($ptype -ne 'Feature') { $problems += "parent is $ptype $($w.ParentWorkItemId), not a Feature" }
+    }
+    if ($problems.Count -gt 0) { New-WorkItemRow $Project $w ("Ready with " + ($problems -join ', ')) }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Ready Story meets the Definition of Ready ($($rows.Count) checked)" `
+    -Singular "Ready Story falls short of the Definition of Ready" -Plural "Ready Stories fall short of the Definition of Ready" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK355_ReadyStoriesHaveAnEstimate {
+  # Every Story in the ReadyState state carries an estimate (EstimateField setting): sizing
+  # is part of refinement, the last step before Ready, not of Sprint Planning. Tightens WRK850.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $field = [string](Get-Setting 'EstimateField' 'StoryPoints')
+  $rows = Get-ReadyStoryRows $Project $field
+  if ($null -eq $rows) { Add-NoReadyStateResult $Project $code; return }
+  $items = @($rows | Where-Object { $null -eq $_.$field } | ForEach-Object { New-WorkItemRow $Project $_ "Ready with no $field" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Ready Story has an estimate ($($rows.Count) checked)" `
+    -Singular "Ready Story has no estimate" -Plural "Ready Stories have no estimate" -Detail (Get-TypeCounts $items)
+}
+
+function Get-ChildTaskMap($Project) {
+  # Parent ID -> its child Tasks in any state but Removed, with Remaining Work and assignee.
+  $tasks = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + " and StateCategory ne 'Removed' and ParentWorkItemId ne null") `
+    -Select "WorkItemId,WorkItemType,State,StateCategory,ParentWorkItemId,RemainingWork,AssignedToUserSK"
+  $map = @{}
+  foreach ($t in $tasks) {
+    $k = [int]$t.ParentWorkItemId
+    if (-not $map.ContainsKey($k)) { $map[$k] = New-Object System.Collections.Generic.List[object] }
+    $map[$k].Add($t)
+  }
+  return $map
+}
+
+function Rule_WRK356_ReadyStoriesHaveAtLeastOneTask {
+  # Every Story in the ReadyState state has at least one child Task, so the team has thought
+  # through how it will be built before it is pulled into a sprint. WRK357 is the stricter
+  # form; turn on one or the other.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $rows = Get-ReadyStoryRows $Project
+  if ($null -eq $rows) { Add-NoReadyStateResult $Project $code; return }
+  $map = Get-ChildTaskMap $Project
+  $items = @($rows | Where-Object { -not $map.ContainsKey([int]$_.WorkItemId) } | ForEach-Object { New-WorkItemRow $Project $_ "Ready with no Tasks" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Ready Story has a Task ($($rows.Count) checked)" `
+    -Singular "Ready Story has no Tasks" -Plural "Ready Stories have no Tasks" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK357_ReadyStoriesAreBrokenIntoEstimatedTasks {
+  # A Story in the ReadyState state, or in a sprint that has not started, has at least one
+  # child Task and every open child Task has Remaining Work; with PreAssignTasks (setting,
+  # false) each open Task also has an Assigned To. For teams that task out in refinement.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $ready = Get-ReadyState
+  $preAssign = [bool](Get-Setting 'PreAssignTasks' $false)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + (Get-OpenFilter)) `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath,StartDate,EndDate)"
+  $scope = @($rows | Where-Object { ($ready -and [string]$_.State -ieq $ready) -or (Get-SprintPhase $_.Iteration) -eq 'future' })
+  $map = Get-ChildTaskMap $Project
+  $items = @(foreach ($w in $scope) {
+    $why = if ($ready -and [string]$w.State -ieq $ready) { "Ready" } else { "In $($w.Iteration.IterationPath), not started" }
+    if (-not $map.ContainsKey([int]$w.WorkItemId)) { New-WorkItemRow $Project $w "$why with no Tasks"; continue }
+    $open = @($map[[int]$w.WorkItemId] | Where-Object { $_.StateCategory -ne 'Completed' })
+    $problems = @()
+    $noHours = @($open | Where-Object { $null -eq $_.RemainingWork }).Count
+    if ($noHours -gt 0) { $problems += "$(Format-Count $noHours 'Task') without Remaining Work" }
+    if ($preAssign) {
+      $unassigned = @($open | Where-Object { -not $_.AssignedToUserSK }).Count
+      if ($unassigned -gt 0) { $problems += "$(Format-Count $unassigned 'Task') unassigned" }
+    }
+    if ($problems.Count -gt 0) { New-WorkItemRow $Project $w ("$why with " + ($problems -join ', ')) }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every Ready or upcoming Story is fully tasked ($($scope.Count) checked)" `
+    -Singular "Ready or upcoming Story is not fully tasked" -Plural "Ready or upcoming Stories are not fully tasked" -Detail (Get-TypeCounts $items)
+}
+
+
+# ---- Bugs (WRK420)
+
+function Rule_WRK420_NoBugsCreatedAfterTheTypeIsRetired {
+  # No Bug was created on or after BugRetiredDate (setting, yyyy-MM-dd); work that looks like
+  # a bug is a Story with the agreed marker. CFG230 catches the open ones of any age.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $date = [string](Get-Setting 'BugRetiredDate' '')
+  if (-not $date) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No BugRetiredDate setting; nothing checked." -Note "No BugRetiredDate setting"
+    return
+  }
+  $since = [datetime]::ParseExact($date, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Bug') + " and CreatedDate ge $($since.ToString('yyyy-MM-dd'))T00:00:00Z") `
+    -Select "WorkItemId,Title,WorkItemType,State,CreatedDate" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "Created $(Format-Day $_.CreatedDate), after the Bug type was retired on $date" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Bugs created since $date" -Singular "Bug created after $date" -Plural "Bugs created after $date"
+}
+
+
+# ---- Tasks: flow during the sprint (WRK545, WRK550)
+
+function Rule_WRK545_RemainingWorkMovesOnInProgressTasks {
+  # An In Progress Task has had its Remaining Work changed within RemainingWorkMaxDays
+  # (setting, 1) working days, counted from when it went In Progress: Task hours are updated
+  # at least by the end of each day, or the burndown is a guess. Reads the Task's revisions.
+  # Differs from WRK550, which is about how long the Task has been In Progress at all.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [int](Get-Setting 'RemainingWorkMaxDays' 1)
+  $tasks = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + " and StateCategory eq 'InProgress'") `
+    -Select "WorkItemId,Title,WorkItemType,State,StateChangeDate,RemainingWork" -Expand "Area(`$select=AreaPath)"
+  $candidates = @($tasks | Where-Object { (Get-WorkingDaysSince $_.StateChangeDate) -gt $max })
+  $revs = @{}
+  if ($candidates.Count -gt 0) {
+    foreach ($r in (Get-WorkItemRevisionRows -Project $Project -Ids @($candidates | ForEach-Object { [int]$_.WorkItemId }) -Select 'WorkItemId,Revision,ChangedDate,RemainingWork')) {
+      $k = [int]$r.WorkItemId
+      if (-not $revs.ContainsKey($k)) { $revs[$k] = New-Object System.Collections.Generic.List[object] }
+      $revs[$k].Add($r)
+    }
+  }
+  $items = @(foreach ($t in $candidates) {
+    $history = @($revs[[int]$t.WorkItemId] | Sort-Object { [int]$_.Revision } -Descending)
+    if ($history.Count -eq 0) { continue }
+    # Walk back from the latest revision while Remaining Work is unchanged; the oldest revision
+    # in that run is when the current value was set.
+    $current = $history[0].RemainingWork
+    $since = $history[0].ChangedDate
+    foreach ($h in $history) { if ([string]$h.RemainingWork -ne [string]$current) { break }; $since = $h.ChangedDate }
+    if ((ConvertTo-UtcInstant $since) -lt (ConvertTo-UtcInstant $t.StateChangeDate)) { $since = $t.StateChangeDate }
+    $age = Get-WorkingDaysSince $since
+    if ($age -gt $max) {
+      $value = if ($null -eq $current) { "empty" } else { [string]$current }
+      New-WorkItemRow $Project $t ("Remaining Work {0} unchanged since {1}, {2} working days" -f $value, (Format-Day $since), $age)
+    }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every In Progress Task had its Remaining Work updated within $max working days ($($tasks.Count) in progress)" `
+    -Singular "In Progress Task has stale Remaining Work" -Plural "In Progress Tasks have stale Remaining Work"
+}
+
+function Rule_WRK550_TasksDoNotStayInProgressTooLong {
+  # A Task In Progress for more than TaskMaxDays (setting, 1) working days is blocked or was
+  # never a Task; it belongs in the Daily Scrum. Measured from the last state change.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [int](Get-Setting 'TaskMaxDays' 1)
+  $tasks = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter 'Task') + " and StateCategory eq 'InProgress'") `
+    -Select "WorkItemId,Title,WorkItemType,State,StateChangeDate" -Expand "Area(`$select=AreaPath)"
+  $items = @(foreach ($t in $tasks) {
+    $age = Get-WorkingDaysSince $t.StateChangeDate
+    if ($age -gt $max) { New-WorkItemRow $Project $t ("In Progress since {0}, {1} working days" -f (Format-Day $t.StateChangeDate), $age) }
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Task has been In Progress for more than $(Format-Count $max 'working day') ($($tasks.Count) in progress)" `
+    -Singular "Task has been In Progress for more than $(Format-Count $max 'working day')" -Plural "Tasks have been In Progress for more than $(Format-Count $max 'working day')"
+}
+
+
+# ---- Hierarchy (WRK705)
+
+function Get-BacklogLevelMap($Project) {
+  # Work item type -> backlog rank, higher is closer to the portfolio, from the project's
+  # backlog configuration (portfolio levels, the requirement level, the task level), so a
+  # custom portfolio level such as Initiative counts. Bugs take the requirement or task rank
+  # their bugsBehavior says. Falls back to Epic 4, Feature 3, Story 2, Task 1 (Bugs per
+  # BugsAreRequirements) when the configuration cannot be read. Cached per project.
+  if (-not $script:BacklogLevelCache) { $script:BacklogLevelCache = @{} }
+  $key = [string]$Project.id
+  if ($script:BacklogLevelCache.ContainsKey($key)) { return $script:BacklogLevelCache[$key] }
+  $map = @{}
+  try {
+    $cfg = Invoke-AdoGet -Uri ($script:CoreBase + "$([uri]::EscapeDataString([string]$Project.name))/_apis/work/backlogconfiguration?api-version=$($script:ApiVersion)")
+    foreach ($b in (@($cfg.portfolioBacklogs) + @($cfg.requirementBacklog, $cfg.taskBacklog))) {
+      if (-not $b) { continue }
+      foreach ($t in @($b.workItemTypes)) { $map[[string]$t.name] = [int]$b.rank }
+    }
+    if (-not $map.ContainsKey('Bug')) {
+      if ([string]$cfg.bugsBehavior -eq 'asRequirements') { $map['Bug'] = [int]$cfg.requirementBacklog.rank }
+      elseif ([string]$cfg.bugsBehavior -eq 'asTasks') { $map['Bug'] = [int]$cfg.taskBacklog.rank }
+    }
+  } catch {
+    $map = @{ 'Epic' = 4; 'Feature' = 3; 'User Story' = 2; 'Product Backlog Item' = 2; 'Requirement' = 2; 'Task' = 1 }
+  }
+  if (-not $map.ContainsKey('Bug')) { $map['Bug'] = if ([bool](Get-Setting 'BugsAreRequirements' $true)) { 2 } else { 1 } }
+  $script:BacklogLevelCache[$key] = $map
+  return $map
+}
+
+function Rule_WRK705_ParentChildLinksFollowTheBacklogHierarchy {
+  # Every parent sits on a higher backlog level than its child: Epic over Feature, Feature
+  # over Story, Story or Bug over Task. A Task as the parent of a Product Backlog Item is
+  # upside down and drops both off the board. Levels come from the backlog configuration
+  # (Get-BacklogLevelMap); closed items count as well as open, Removed ones do not.
+  # Same-type links are WRK700's business.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $levels = Get-BacklogLevelMap $Project
+  $children = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter @($levels.Keys)) + " and StateCategory ne 'Removed' and ParentWorkItemId ne null") `
+    -Select "WorkItemId,Title,WorkItemType,State,ParentWorkItemId" -Expand "Area(`$select=AreaPath)"
+  $parents = @{}
+  if ($children.Count -gt 0) { $parents = Get-WorkItemFields -Ids @($children | ForEach-Object { [int]$_.ParentWorkItemId }) -Fields @('System.WorkItemType', 'System.State') }
+  $items = @(foreach ($c in $children) {
+    $pk = [int]$c.ParentWorkItemId
+    if (-not $parents.ContainsKey($pk)) { continue }
+    $ptype = [string]$parents[$pk].'System.WorkItemType'
+    if ($ptype -eq [string]$c.WorkItemType) { continue }
+    if ([string]$parents[$pk].'System.State' -eq 'Removed') { continue }
+    $cl = $levels[[string]$c.WorkItemType]; $pl = $levels[$ptype]
+    if ($null -eq $cl -or $null -eq $pl -or $pl -gt $cl) { continue }
+    $how = if ($pl -eq $cl) { "on the same backlog level" } else { "on a lower backlog level" }
+    $row = New-WorkItemRow $Project $c "Parent is $ptype $pk, $how"
+    $row.ParentId = $pk; $row.ParentType = $ptype
+    $row
+  })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every parent sits above its child ($($children.Count) parent links checked)" `
+    -Singular "item has a parent at or below its own backlog level" -Plural "items have a parent at or below their own backlog level" -Detail (Get-TypeCounts $items)
+}
+
+
+# ---- Backlog order (WRK790, WRK795, WRK796)
+
+function Rule_WRK790_ActiveItemsRankAboveNewItems {
+  # Within each team backlog no In Progress Story ranks below one that has not started (New,
+  # or Ready): working on position 11 while 1 to 6 are untouched means the order is not the
+  # plan. Each item is reported once, for the first team backlog it shows on.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $seen = @{}
+  $checked = 0
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($o in (Get-TeamBacklogOrders $Project)) {
+    $notStarted = 0; $first = $null; $pos = 0
+    foreach ($w in $o.Items) {
+      $pos++
+      if ($w.StateCategory -eq 'Proposed') { $notStarted++; if (-not $first) { $first = $w }; continue }
+      if ($w.StateCategory -notin 'InProgress', 'Resolved') { continue }
+      $checked++
+      if ($notStarted -gt 0 -and -not $seen.ContainsKey([int]$w.WorkItemId)) {
+        $seen[[int]$w.WorkItemId] = $true
+        $items.Add((New-WorkItemRow $Project $w ("Position {0} on the {1} backlog, below {2} (the first is {3} {4})" -f $pos, $o.Team, (Format-Count $notStarted 'item not started' 'items not started'), $first.WorkItemType, $first.WorkItemId)))
+      }
+    }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No active Story ranks below one not started ($checked active placements checked)" `
+    -Singular "active Story ranks below items not started" -Plural "active Stories rank below items not started" -Detail (Get-TypeCounts $items.ToArray())
+}
+
+function Rule_WRK795_BacklogOrderFollowsTheSprint {
+  # In each team backlog the current sprint's Stories rank above the next sprint's, which rank
+  # above later sprints', which rank above unscheduled ones; within each group In Progress
+  # ranks above Ready (ReadyState), which ranks above New. Reports the fewest items that would
+  # have to move to put the backlog in that order. Subsumes WRK790; turn on one or the other.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $ready = Get-ReadyState
+  $seen = @{}
+  $checked = 0
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($o in (Get-TeamBacklogOrders $Project)) {
+    $futureStarts = @($o.Items | Where-Object { (Get-SprintPhase $_.Iteration) -eq 'future' } | ForEach-Object { (ConvertTo-IterationDay $_.Iteration.StartDate).Ticks } | Sort-Object -Unique)
+    $keys = New-Object 'System.Collections.Generic.List[double]'
+    $labels = New-Object System.Collections.Generic.List[string]
+    foreach ($w in $o.Items) {
+      $phase = Get-SprintPhase $w.Iteration
+      $group = switch ($phase) {
+        'current' { 0 }
+        'past'    { 0 }
+        'future'  { 1 + [array]::IndexOf($futureStarts, (ConvertTo-IterationDay $w.Iteration.StartDate).Ticks) }
+        default   { 900 }
+      }
+      $stateRank = if ($w.StateCategory -in 'InProgress', 'Resolved') { 0 } elseif ($ready -and [string]$w.State -ieq $ready) { 1 } else { 2 }
+      $keys.Add([double]($group * 10 + $stateRank))
+      $where = if ($group -eq 900) { "not in a sprint" } else { "in $($w.Iteration.IterationPath)" }
+      $labels.Add("$($w.State) $where")
+    }
+    $checked += $o.Items.Count
+    foreach ($i in (Get-OutOfOrderIndexes $keys.ToArray())) {
+      $w = $o.Items[$i]
+      if ($seen.ContainsKey([int]$w.WorkItemId)) { continue }
+      $seen[[int]$w.WorkItemId] = $true
+      $items.Add((New-WorkItemRow $Project $w ("Out of order at position {0} on the {1} backlog: {2}" -f ($i + 1), $o.Team, $labels[$i])))
+    }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every team backlog runs current sprint, next sprint, then the rest ($checked placements checked)" `
+    -Singular "Story is out of sprint and state order" -Plural "Stories are out of sprint and state order" -Detail (Get-TypeCounts $items.ToArray())
+}
+
+function Rule_WRK796_BacklogOrderIsChangedOnlyByTheProductOwners {
+  # Over the last BacklogOrderWindowDays (setting, 30), every change to the backlog order
+  # (Backlog Priority on Epics, Features and Stories) was made by one of BacklogOrderOwners
+  # (setting; defaults to ProductOwners): the Product Owner orders the backlog and the team
+  # does not reorder it. Reads revisions; the first value an item gets is not a reorder.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $owners = @(Get-SettingList 'BacklogOrderOwners' @(Get-SettingList 'ProductOwners' @()))
+  if ($owners.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No BacklogOrderOwners or ProductOwners setting; nothing checked." -Note "No BacklogOrderOwners or ProductOwners setting"
+    return
+  }
+  $days = [int](Get-Setting 'BacklogOrderWindowDays' 30)
+  $cutoff = Get-UtcCutoff $days
+  $types = @('Epic', 'Feature') + (Get-RequirementTypes)
+  # RevisedDate is when a revision was superseded, so this also returns the last revision
+  # before the window, the baseline the first change in the window is compared with.
+  $revs = Get-AnalyticsEntity -Project $Project -Entity 'WorkItemRevisions' -Filter ((New-TypeFilter $types) + " and RevisedDate ge $cutoff") `
+    -Select 'WorkItemId,Revision,ChangedDate,BacklogPriority,Title,WorkItemType,State' -Expand "ChangedBy(`$select=UserName,UserEmail),Area(`$select=AreaPath)"
+  $cutoffInstant = ConvertTo-UtcInstant $cutoff
+  $byItem = @{}
+  foreach ($r in $revs) {
+    $k = [int]$r.WorkItemId
+    if (-not $byItem.ContainsKey($k)) { $byItem[$k] = New-Object System.Collections.Generic.List[object] }
+    $byItem[$k].Add($r)
+  }
+  $changes = 0
+  $items = New-Object System.Collections.Generic.List[object]
+  foreach ($k in $byItem.Keys) {
+    $history = @($byItem[$k] | Sort-Object { [int]$_.Revision })
+    $outside = New-Object System.Collections.Generic.List[object]
+    for ($i = 1; $i -lt $history.Count; $i++) {
+      $prev = $history[$i - 1]; $r = $history[$i]
+      if ([int]$r.Revision -ne [int]$prev.Revision + 1) { continue }
+      if ($null -eq $prev.BacklogPriority -or [string]$prev.BacklogPriority -eq [string]$r.BacklogPriority) { continue }
+      if ((ConvertTo-UtcInstant $r.ChangedDate) -lt $cutoffInstant) { continue }
+      $changes++
+      if (-not (Test-NameInList $owners @([string]$r.ChangedBy.UserName, [string]$r.ChangedBy.UserEmail))) { $outside.Add($r) }
+    }
+    if ($outside.Count -gt 0) {
+      $last = $outside[$outside.Count - 1]
+      $who = (@($outside | ForEach-Object { [string]$_.ChangedBy.UserName }) | Select-Object -Unique) -join ', '
+      $items.Add((New-WorkItemRow $Project $history[-1] ("Reordered {0} by {1}, last on {2}" -f (Format-Count $outside.Count 'time'), $who, (Format-Day $last.ChangedDate))))
+    }
+  }
+  $byWho = (@($items | ForEach-Object { ($_.Problem -replace '^Reordered .*? by (.*), last on .*$', '$1') -split ', ' }) | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Every reorder in the last $days days was by a Product Owner ($changes reorders)" `
+    -Singular "item was reordered by someone other than a Product Owner" -Plural "items were reordered by someone other than a Product Owner" -Detail $byWho
+}
+
+
+# ---- Fields and age (WRK888, WRK905, WRK917, WRK923)
+
+function Rule_WRK888_UnusedFieldsStayAtTheirDefaults {
+  # The fields in UnusedFields (setting; Analytics column names such as OriginalEstimate,
+  # CompletedWork, or Name=default such as Priority=2) hold nothing, or their default, on open
+  # items, or on every item created since UnusedFieldsSince (setting, yyyy-MM-dd) when set:
+  # the client decided not to track them, so a value is noise somebody will one day report on.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $specs = @(Get-SettingList 'UnusedFields' @())
+  if ($specs.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No UnusedFields setting; nothing checked." -Note "No UnusedFields setting"
+    return
+  }
+  $since = [string](Get-Setting 'UnusedFieldsSince' '')
+  $scope = if ($since) { " and CreatedDate ge $($since)T00:00:00Z" } else { Get-OpenFilter }
+  $items = New-Object System.Collections.Generic.List[object]
+  $notes = @()
+  foreach ($spec in $specs) {
+    $name, $default = $spec -split '=', 2
+    $name = $name.Trim()
+    $cond = "$name ne null"
+    if ($null -ne $default -and $default.Trim()) {
+      $d = $default.Trim(); $num = 0.0
+      $literal = if ([double]::TryParse($d, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$num)) { $d } else { "'$(ConvertTo-ODataString $d)'" }
+      $cond += " and $name ne $literal"
+    }
+    try {
+      $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:HierarchyTypes) + $scope + " and $cond") -Select "WorkItemId,Title,WorkItemType,State,$name" -Expand "Area(`$select=AreaPath)"
+    } catch {
+      if ($_.Exception.Message -match 'HTTP 400') { $notes += "$name is not an Analytics column here"; continue }
+      throw
+    }
+    foreach ($r in $rows) { $items.Add((New-WorkItemRow $Project $r "$name is $($r.$name)")) }
+  }
+  $what = if ($since) { "items created since $since" } else { "open items" }
+  $extra = if ($notes.Count -gt 0) { "; " + ($notes -join '; ') } else { "" }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No $what carry a value in $($specs -join ', ')$extra" `
+    -Singular "item carries a value in an unused field" -Plural "items carry a value in an unused field" -Detail ((Get-TypeCounts $items.ToArray()) + $extra)
+}
+
+function Rule_WRK905_OldClosedItemsAreRemoved {
+  # Where a client archives by state, anything Done longer than RemoveAfterDays (setting,
+  # 365) is moved to Removed, so boards and queries stay light. Off unless the client works
+  # that way.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $days = [int](Get-Setting 'RemoveAfterDays' 365)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:HierarchyTypes) + " and StateCategory eq 'Completed' and CompletedDate lt $(Get-UtcCutoff $days)") `
+    -Select "WorkItemId,Title,WorkItemType,State,CompletedDate" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "$($_.State) since $(Format-Day $_.CompletedDate)" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "Nothing has been Done for more than $days days" `
+    -Singular "item has been Done for more than $days days" -Plural "items have been Done for more than $days days" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK917_NoOpenItemsPastTheMaximumAge {
+  # Nothing open was created more than MaxAgeDays (setting, 365) ago, whatever its activity:
+  # ask the owner at eleven months, remove at twelve. WRK900 is about items nobody touches;
+  # this one catches the ones touched forever and never finished.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $days = [int](Get-Setting 'MaxAgeDays' 365)
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:HierarchyTypes) + (Get-OpenFilter) + " and CreatedDate lt $(Get-UtcCutoff $days)") `
+    -Select "WorkItemId,Title,WorkItemType,State,CreatedDate" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | ForEach-Object { New-WorkItemRow $Project $_ "Created $(Format-Day $_.CreatedDate)" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open item is older than $days days" `
+    -Singular "open item is older than $days days" -Plural "open items are older than $days days" -Detail (Get-TypeCounts $items)
+}
+
+function Rule_WRK923_TitlesDoNotCarryDatesOrDeadlines {
+  # No open item's title carries a date or a deadline (TitleDatePattern setting; by default
+  # 9/21, 9/21/26, NLT, "due 10"): a hard deadline goes in Target Date, where WRK925 can see
+  # it, and a date in a title goes stale while the item lives on.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $pattern = [string](Get-Setting 'TitleDatePattern' '(?i)\b\d{1,2}/\d{1,2}(/\d{2,4})?\b|\bNLT\b|\bdue\s+(by\s+)?\d')
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:HierarchyTypes) + (Get-OpenFilter)) -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+  $items = @($rows | Where-Object { [string]$_.Title -match $pattern } | ForEach-Object { New-WorkItemRow $Project $_ "Title carries a date or deadline ($([regex]::Match([string]$_.Title, $pattern).Value))" })
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No open title carries a date or deadline ($($rows.Count) checked)" `
+    -Singular "open item's title carries a date or deadline" -Plural "open items' titles carry a date or deadline" -Detail (Get-TypeCounts $items)
+}
+
+
+# ---- Sprint boundaries (WRK945, WRK947, WRK949)
+
+function Rule_WRK945_ItemsAreNotCarriedOverBetweenSprints {
+  # The share of the current sprint's Stories (and Bugs when they are requirements) that
+  # were also in the previous sprint stays at or below CarryoverMaxPercent (setting, 10).
+  # Unfinished work goes back to the backlog and comes back only if the Product Owner orders
+  # it there again. Reads revisions for the previous sprint's iteration.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $max = [double](Get-Setting 'CarryoverMaxPercent' 10)
+  $today = (Get-Date).ToUniversalTime().Date
+  $calendar = @(Get-SprintCalendar $Project)
+  $current = @($calendar | Where-Object { $_.Start -le $today -and $_.End -ge $today })
+  if ($current.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No sprint is running today; nothing checked." -Note "No current sprint"
+    return
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  $parts = @()
+  $worst = 0.0
+  foreach ($s in $current) {
+    $prev = Get-PreviousSprint $calendar $s
+    if (-not $prev) { continue }
+    $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter (Get-RequirementTypes)) + " and StateCategory ne 'Removed' and Iteration/IterationPath eq '$(ConvertTo-ODataString $s.Path)'") `
+      -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath)"
+    if ($rows.Count -eq 0) { continue }
+    $sk = Get-IterationSK $Project $prev.Path
+    $carried = @{}
+    if ($sk) {
+      foreach ($r in (Get-WorkItemRevisionRows -Project $Project -Ids @($rows | ForEach-Object { [int]$_.WorkItemId }) -Select 'WorkItemId' -Filter "IterationSK eq $sk")) { $carried[[int]$r.WorkItemId] = $true }
+    }
+    $share = [math]::Round(100.0 * $carried.Count / $rows.Count)
+    if ($share -gt $worst) { $worst = $share }
+    $parts += "$($s.Name): $($carried.Count) of $($rows.Count) ($share%) from $($prev.Name)"
+    if ($share -gt $max) {
+      foreach ($w in ($rows | Where-Object { $carried.ContainsKey([int]$_.WorkItemId) })) { $items.Add((New-WorkItemRow $Project $w "In $($s.Name), and was in $($prev.Name)")) }
+    }
+  }
+  if ($parts.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "No previous sprint, or nothing in the current one; nothing checked." -Note "Nothing to compare"
+    return
+  }
+  $summary = $parts -join '; '
+  if ($items.Count -eq 0) {
+    Add-Result -Project $Project -Rule $code -Status $script:StatusPass -Description "Carryover within $max%: $summary." -Note "Carryover within $max% ($summary)"
+    return
+  }
+  Add-Result -Project $Project -Rule $code -Status $script:StatusWarning -Description "Carryover above $max%: $summary." -Note "$worst% of the sprint carried over, limit $max%" -Items @($items | Sort-Object Type, Id)
+}
+
+function Rule_WRK947_NoStoriesSplitAtSprintEnd {
+  # No Story was created in the last SplitWindowDays (setting, 2) of a sprint, or the first
+  # day of the next, as a split of a Story in that sprint: a Related link to it, Tasks
+  # reparented from it (read from revisions), or the same title once split markers are
+  # stripped ("part 2", "continued"). Moving leftover Tasks to a new PBI is carryover, not a
+  # split, and splitting to close the sprint makes the plan match the outcome by
+  # construction. Looks at sprints that ended in the last CycleWindowDays.
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $window = [int](Get-Setting 'SplitWindowDays' 2)
+  $lookback = [int](Get-Setting 'CycleWindowDays' 90)
+  $today = (Get-Date).ToUniversalTime().Date
+  $calendar = @(Get-SprintCalendar $Project)
+  $ended = @($calendar | Where-Object { $_.End -lt $today -and $_.End -ge $today.AddDays(-$lookback) })
+  $items = New-Object System.Collections.Generic.List[object]
+  $checked = 0
+  foreach ($s in $ended) {
+    $from = $s.End.AddDays(1 - $window)
+    $to = $s.End.AddDays(2)   # through the first day of the next sprint
+    $new = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + " and StateCategory ne 'Removed' and CreatedDate ge $($from.ToString('yyyy-MM-dd'))T00:00:00Z and CreatedDate lt $($to.ToString('yyyy-MM-dd'))T00:00:00Z") `
+      -Select "WorkItemId,Title,WorkItemType,State,CreatedDate" -Expand "Area(`$select=AreaPath)"
+    if ($new.Count -eq 0) { continue }
+    $checked += $new.Count
+    $originals = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + " and StateCategory ne 'Removed' and Iteration/IterationPath eq '$(ConvertTo-ODataString $s.Path)' and CreatedDate lt $($from.ToString('yyyy-MM-dd'))T00:00:00Z") `
+      -Select "WorkItemId,Title,WorkItemType,State"
+    $byStem = @{}
+    $byId = @{}
+    foreach ($o in $originals) {
+      $byId[[int]$o.WorkItemId] = $o
+      $stem = Get-TitleStem ([string]$o.Title)
+      if ($stem -and -not $byStem.ContainsKey($stem)) { $byStem[$stem] = $o }
+    }
+    $newIds = @($new | ForEach-Object { [int]$_.WorkItemId })
+    $relations = Get-WorkItemRelations -Ids $newIds
+    # Tasks now under a new Story that once sat under one of the originals: the leftover Tasks
+    # moved to a fresh PBI, which is how the Split! extension carries work over.
+    $tookFrom = @{}
+    for ($i = 0; $i -lt $newIds.Count; $i += 150) {
+      $batch = $newIds[$i..([Math]::Min($i + 149, $newIds.Count - 1))]
+      $kids = Get-AnalyticsWorkItems -Project $Project -Filter "WorkItemType eq 'Task' and ParentWorkItemId in ($($batch -join ','))" -Select "WorkItemId,ParentWorkItemId"
+      if ($kids.Count -eq 0) { continue }
+      $nowUnder = @{}
+      foreach ($k in $kids) { $nowUnder[[int]$k.WorkItemId] = [int]$k.ParentWorkItemId }
+      foreach ($r in (Get-WorkItemRevisionRows -Project $Project -Ids @($nowUnder.Keys) -Select 'WorkItemId,ParentWorkItemId')) {
+        if ($null -eq $r.ParentWorkItemId) { continue }
+        $was = [int]$r.ParentWorkItemId
+        if ($byId.ContainsKey($was)) { $tookFrom[$nowUnder[[int]$r.WorkItemId]] = $was }
+      }
+    }
+    foreach ($w in $new) {
+      $match = $null; $how = $null
+      foreach ($rel in @($relations[[int]$w.WorkItemId] | Where-Object { $_.rel -eq 'System.LinkTypes.Related' })) {
+        $rid = [int](([string]$rel.url) -replace '^.*/', '')
+        if ($byId.ContainsKey($rid)) { $match = $byId[$rid]; $how = 'related to'; break }
+      }
+      if (-not $match -and $tookFrom.ContainsKey([int]$w.WorkItemId)) { $match = $byId[$tookFrom[[int]$w.WorkItemId]]; $how = 'took Tasks from' }
+      if (-not $match) {
+        $stem = Get-TitleStem ([string]$w.Title)
+        if ($stem -and $byStem.ContainsKey($stem)) { $match = $byStem[$stem]; $how = 'same title as' }
+      }
+      if ($match) {
+        $row = New-WorkItemRow $Project $w ("Created {0} at the end of {1}, {2} {3} {4}" -f (Format-Day $w.CreatedDate), $s.Name, $how, $match.WorkItemType, $match.WorkItemId)
+        $row.ParentId = $null
+        $items.Add($row)
+      }
+    }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No Stories split at the end of the $(Format-Count $ended.Count 'sprint') that ended in the last $lookback days ($checked created at sprint ends)" `
+    -Singular "Story was split off at a sprint end" -Plural "Stories were split off at a sprint end"
+}
+
+function Rule_WRK949_NoSerialPhaseStories {
+  # No title stem recurs with an incrementing number across sprints (Rollout Phase 7, Rollout
+  # Phase 8): the same work renamed each sprint is carryover by another name. Looks at Stories
+  # created in the last SerialWindowDays (setting, 180) whose title matches SerialTitlePattern
+  # (setting; a named group stem and a number n after phase, part, step, stage, round, wave or batch).
+  param($Project)
+  $code = Get-RuleCode $MyInvocation.MyCommand.Name
+  $days = [int](Get-Setting 'SerialWindowDays' 180)
+  $pattern = [string](Get-Setting 'SerialTitlePattern' '(?i)^(?<stem>.*?\S)[\s\-:,(#]*\b(phase|part|pt|step|stage|round|wave|batch)\s*#?(?<n>\d+)\b')
+  $rows = Get-AnalyticsWorkItems -Project $Project -Filter ((New-TypeFilter $script:StoryTypes) + " and StateCategory ne 'Removed' and CreatedDate ge $(Get-UtcCutoff $days)") `
+    -Select "WorkItemId,Title,WorkItemType,State" -Expand "Area(`$select=AreaPath),Iteration(`$select=IterationPath)"
+  $series = @{}
+  foreach ($w in $rows) {
+    $m = [regex]::Match([string]$w.Title, $pattern)
+    if (-not $m.Success) { continue }
+    $stem = (($m.Groups['stem'].Value.ToLowerInvariant()) -replace '[^a-z0-9]+', ' ').Trim()
+    if (-not $stem) { continue }
+    if (-not $series.ContainsKey($stem)) { $series[$stem] = New-Object System.Collections.Generic.List[object] }
+    $series[$stem].Add([pscustomobject]@{ Row = $w; N = [int]$m.Groups['n'].Value; Iteration = if ($w.Iteration) { [string]$w.Iteration.IterationPath } else { "" } })
+  }
+  $items = New-Object System.Collections.Generic.List[object]
+  $count = 0
+  foreach ($stem in $series.Keys) {
+    $s = $series[$stem].ToArray()
+    if (@($s | ForEach-Object { $_.N } | Select-Object -Unique).Count -lt 2) { continue }
+    if (@($s | ForEach-Object { $_.Iteration } | Select-Object -Unique).Count -lt 2) { continue }
+    $count++
+    $list = ($s | Sort-Object N | ForEach-Object { "$($_.N) ($($_.Row.WorkItemId), $($_.Iteration -replace '^.*\\', ''))" }) -join ', '
+    foreach ($e in $s) { $items.Add((New-WorkItemRow $Project $e.Row "One of $($s.Count) numbered Stories in a series: $list")) }
+  }
+  Add-CountResult -Project $Project -RuleCode $code -Items $items -PassNote "No numbered Story series across sprints ($($rows.Count) Stories checked)" `
+    -Singular "Story belongs to a numbered series across sprints" -Plural "Stories belong to numbered series across sprints" -Detail "$(Format-Count $count 'series' 'series')"
 }
 
 

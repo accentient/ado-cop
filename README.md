@@ -124,14 +124,17 @@
 
   | Scope (Read) | Used for |
   |:--|:--|
-  | Analytics | Work item queries for every WRK rule |
+  | Analytics | Work item queries for every WRK rule, and work item revisions for WRK545, WRK796, WRK945 and WRK947 |
   | Build | Build pipelines |
   | Code | Git repositories and TFVC |
+  | Extensions | Installed extensions (CFG060) |
   | Graph | Teams and permissions rules, when you enable them |
+  | Member Entitlement Management | Access levels and last sign-in (CFG026, CFG027, CFG029) |
   | Packaging | Artifact feeds |
-  | Project and Team | Project list, process name, area and iteration trees, teams and their members |
+  | Project and Team | Project list, process name, area and iteration trees, teams, their members and team settings |
   | Release | Classic release pipelines |
-  | Work Items | Parent lookups across projects, text fields, links, work item type fields |
+  | Team Dashboard | Dashboards and their widgets (CFG386) |
+  | Work Items | Parent lookups across projects, text fields, links, work item type fields and states, process types, fields, rules and picklists, saved queries, backlog configuration |
 
   Two limits worth knowing. Analytics refuses Stakeholder accounts, so the PAT owner needs
   Basic or higher plus the "View analytics" project permission that Readers and
@@ -267,19 +270,43 @@
   | `StaleDays` | `90` | WRK900 | Days without a change before an open item counts as stale |
   | `BatchWindowDays`, `BatchSize` | `90`, `5` | WRK800 | Look back this many days; this many items closed in one minute is a batch |
   | `EstimateField` | `StoryPoints` | WRK370, WRK372, WRK850, WRK860 | The Analytics estimate column: `StoryPoints` on Agile, `Effort` on Scrum |
-  | `BugsAreRequirements` | `true` | WRK360, WRK370, WRK372, WRK600, WRK850, WRK860, WRK980 | `true` when the teams manage Bugs on the backlog alongside Stories, so the sprint-item rules include Bugs; `false` when Bugs are managed as Tasks |
+  | `BugsAreRequirements` | `true` | WRK360, WRK370, WRK372, WRK600, WRK790, WRK795, WRK796, WRK850, WRK860, WRK945, WRK980 | `true` when the teams manage Bugs on the backlog alongside Stories, so the sprint-item rules include Bugs; `false` when Bugs are managed as Tasks. WRK705 reads the Bug level from the backlog configuration and uses this only when it cannot |
   | `SprintMaxEstimate` | `8` | WRK370 | Largest estimate a Story or Bug may carry inside a sprint |
   | `ChallengeEstimate` | none | WRK372 | The estimate that is allowed but suspect, `5` say; every open Story or Bug sized at it is listed for the Product Owner to challenge. Empty skips the check |
   | `EstimateScale` | none | WRK860 | Comma-separated estimates allowed on open Stories and Bugs, `1,2,3,5` say; an empty estimate is also allowed. Empty skips the check |
   | `TaskMaxHours` | `8` | WRK560 | Most Remaining Work an open Task may carry |
   | `EpicAreas` | the root area | WRK140 | Comma-separated area paths where Epics may live, for a portfolio with its own area; empty means the project's root area only |
   | `PlanAheadSprints` | `1` | WRK785 | How many sprints past the current one may hold open items |
-  | `ProductOwners` | none | WRK190, WRK290, WRK395, WRK815 | Comma-separated display names or emails; when set, every open Epic and Feature (WRK815, or WRK190 and WRK290 by type) and every open Story (WRK395) must be assigned to one of them. Empty means any owner will do |
+  | `ProductOwners` | none | WRK190, WRK290, WRK395, WRK796, WRK815 | Comma-separated display names or emails; when set, every open Epic and Feature (WRK815, or WRK190 and WRK290 by type) and every open Story (WRK395) must be assigned to one of them. Empty means any owner will do. WRK796 also uses it when `BacklogOrderOwners` is empty |
   | `CycleWindowDays` | `90` | WRK980 | Look back this many days at completed Stories and Bugs when comparing Cycle Time to sprint length |
   | `SprintNamePattern` | none | CFG157 | Regular expression every sprint name must match, `^Sprint (\d{3})$` say; a captured number must run without gaps. Empty skips the check |
   | `SprintLengthDays` | none | CFG180 | The agreed sprint length; when set, every sprint must be exactly this long, otherwise the most common length is the norm. Keep it at or below `SprintMaxDays` |
   | `ExpectedTeams` | none | CFG305, CFG307 | Comma-separated team names the project should have. CFG305 flags listed teams that are missing; CFG307 flags teams that exist but are not listed. Empty just lists the teams |
   | `TeamMaxMembers` | `10` | CFG315 | Most members a team may have |
+  | `ReadyState` | `Ready` | WRK168, WRK268, WRK340, WRK352 to WRK357, WRK795 | The state that means refined and ready to pull. Empty switches off the Ready rules |
+  | `ValueClausePattern` | `so that` | WRK168, WRK268, WRK340 | Regular expression a refined item's description must match to count as stating its value; empty means `(?i)\bso\s+that\b` |
+  | `PreAssignTasks` | `false` | WRK357 | `true` for teams that assign Tasks in refinement: every open Task under a Ready or upcoming Story must then have an Assigned To |
+  | `ShellMaxDays` | `5` | WRK345 | Working days an open Story may stay without a description or acceptance criteria |
+  | `TaskMaxDays` | `1` | WRK550 | Working days a Task may stay In Progress |
+  | `RemainingWorkMaxDays` | `1` | WRK545 | Working days an In Progress Task's Remaining Work may stay unchanged |
+  | `AcMinItems` | `3` | WRK167 | Fewest acceptance criteria an Epic should list, counted as bullets or lines |
+  | `LicenseIdleDays` | `90` | CFG026 | Days a paid account may go without signing in |
+  | `TestPlansUsers` | none | CFG027 | Comma-separated names or emails allowed to hold Basic + Test Plans. Empty just lists the holders |
+  | `TestAccounts` | none | CFG029 | Comma-separated names or emails of test and demo accounts, which may hold Stakeholder access at most |
+  | `ExpectedExtensions` | none | CFG060 | Comma-separated extension names (`Split!`) or `publisher.extension` ids the organization should have installed, and no others. Empty just lists what is installed |
+  | `ExpectedStates` | none | CFG225 | An object of work item type to comma-separated states, `{ "Product Backlog Item": "New, Ready, In Progress, Done, Removed" }`. Each listed type must have exactly those states |
+  | `RetiredTypes` | none | CFG230 | Comma-separated work item types being retired; types disabled in the process count without being listed |
+  | `BugRetiredDate` | none | WRK420 | `yyyy-MM-dd` from which no Bug may be created. Empty skips the check |
+  | `PicklistFields` | none | CFG247 | Comma-separated field reference names that must be picklists without custom values |
+  | `RetiredFields` | none | CFG248 | Comma-separated field reference names that must be read-only wherever they sit on a type |
+  | `BacklogOrderOwners`, `BacklogOrderWindowDays` | `ProductOwners`, `30` | WRK796 | Who may change backlog order, and how many days of revisions to read |
+  | `UnusedFields`, `UnusedFieldsSince` | none | WRK888 | Comma-separated Analytics field names that should stay empty, or `Name=default` (`Priority=2`) to allow the default; with `UnusedFieldsSince` (`yyyy-MM-dd`) the check covers every item created since then instead of open items |
+  | `MaxAgeDays` | `365` | WRK917 | Oldest an open item may be, counted from creation |
+  | `RemoveAfterDays` | `365` | WRK905 | Days a Done item may stay before it should be Removed |
+  | `TitleDatePattern` | dates and NLT | WRK923 | Regular expression for a date or deadline in a title; empty means 9/21, 9/21/26, NLT and "due 10" |
+  | `CarryoverMaxPercent` | `10` | WRK945 | Highest share of the current sprint's Stories that may have been in the previous sprint |
+  | `SplitWindowDays` | `2` | WRK947 | Last days of a sprint in which a new Story that matches one in the sprint counts as a split |
+  | `SerialWindowDays`, `SerialTitlePattern` | `180`, phase and part | WRK949 | How far back to look for numbered Story series, and the regular expression (named groups `stem` and `n`) that recognises them; empty means a number after phase, part, step, stage, round, wave or batch |
 
   Every active rule runs once per project, in the order the keys appear. `rules.md` is the
   human-readable catalogue: every rule number, what it checks, why it matters, and which
@@ -345,6 +372,13 @@
   - The report, log and JSON name work items by ID and title. They are client data. Do not
     commit them, and scrub anything you use as a sample. `.gitignore` excludes the default
     output names.
+  - Analytics gives a sprint's start as midnight and its end as 23:59:59.999 in the
+    organization's time zone. Converted to UTC, as on a Microsoft-hosted build agent, the
+    end of a sprint in the Americas falls on the next day, which once made every 21-day
+    sprint measure 22 days and every sprint rule quietly find no sprints. The sprint rules
+    now read those dates as calendar days (`ConvertTo-IterationDay`), so the result is the
+    same on any machine. Iteration dates from the REST classification nodes are UTC
+    midnights and go through `ConvertTo-UtcDate` instead.
   - The rules assume Azure DevOps Services. Azure DevOps Server will mostly work for the
     REST rules and mostly not for the Analytics ones.
 
