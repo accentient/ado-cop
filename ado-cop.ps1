@@ -1613,9 +1613,16 @@ function Test-ClosedParentRule {
   $types = @($items | ForEach-Object { $_.Type } | Select-Object -Unique)
   $what = if ($types.Count -eq 1) { Format-Count $items.Count "open $($types[0])" "open $(Get-Plural $types[0])" } else { Format-Count $items.Count "open item" "open items" }
   $sit = if ($items.Count -eq 1) { "sits" } else { "sit" }
+  # Count the parents too: one closed parent is "a closed Feature", several are "3 closed Features".
+  $parentIds = @($items | ForEach-Object { $_.ParentId } | Select-Object -Unique)
+  $under = if ($parentIds.Count -eq 1) {
+    $pType = [string]$pairs.Parents[[int]$parentIds[0]].WorkItemType
+    $article = if ($pType -match '^[AEIOU]') { "an" } else { "a" }
+    "$article closed $pType"
+  } else { "$($parentIds.Count) closed $ParentPlural" }
   Add-Result -Project $Project -Rule $RuleCode -Status $script:StatusWarning `
-    -Description ("{0} {1} under closed {2} ({3})." -f $what, $sit, $ParentPlural, ($byType -join ', ')) `
-    -Note ("{0} {1} under closed {2}" -f $what, $sit, $ParentPlural) -Items ($items | Sort-Object ParentId, Id)
+    -Description ("{0} {1} under {2} ({3})." -f $what, $sit, $under, ($byType -join ', ')) `
+    -Note ("{0} {1} under {2}" -f $what, $sit, $under) -Items ($items | Sort-Object ParentId, Id)
 }
 
 function Test-AllChildrenClosedRule {
